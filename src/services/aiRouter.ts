@@ -20,7 +20,7 @@ export const MODEL_MODES: ModelModeOption[] = [
     id: 'deepseek-r1',
     label: 'DeepSeek-R1 (Deep Step-by-Step Reasoning)',
     shortLabel: 'DeepSeek-R1',
-    description: 'Deep analytical & multi-step reasoning engine',
+    description: 'DeepSeek V4.1 & Nemotron reasoning engines',
     pollinationsModel: 'openai-fast',
   },
   {
@@ -34,7 +34,7 @@ export const MODEL_MODES: ModelModeOption[] = [
     id: 'coder-pro',
     label: 'Coder Pro (Full-Stack App Builder)',
     shortLabel: 'Coder Pro',
-    description: 'Optimized for complete production code & live sandboxes',
+    description: 'Cohere NorthCode, DeepSeek & Mistral code engines',
     pollinationsModel: 'openai-fast',
   },
   {
@@ -58,7 +58,10 @@ export interface RunChatStreamParams {
 }
 
 const REALTIME_KEYWORDS =
-  /\b(today|latest|current|news|weather|price|stock|bitcoin|crypto|score|winner|who won|release|2025|2026|now|recent|live|forecast|docs|documentation|what is the date)\b/i;
+  /\b(today|latest|current|currently|news|headline|headlines|weather|forecast|price|stock|bitcoin|crypto|score|winner|who won|release|released|2025|2026|now|recent|recently|live|docs|documentation|what is the date|what day is|who is the)\b/i;
+
+const CASUAL_OR_BUILD_ONLY =
+  /^\s*(hi|hello|hey|yo|sup|good morning|good afternoon|good evening|how are you|thanks|thank you|ok|okay|build |create |make |design |write |code |fix |debug |refactor )/i;
 
 function createLinkedTimeoutSignal(
   parentSignal: AbortSignal,
@@ -83,24 +86,6 @@ function createLinkedTimeoutSignal(
   };
 }
 
-function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error('Aborted'));
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      window.clearTimeout(timer);
-      reject(new Error('Aborted'));
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
 export function shouldTriggerLiveSearch(
   prompt: string,
   modelMode: ModelModeId,
@@ -108,14 +93,18 @@ export function shouldTriggerLiveSearch(
 ): boolean {
   if (modelMode === 'searchgpt') return true;
   if (!liveSearchEnabled) return false;
-  return REALTIME_KEYWORDS.test(prompt) || liveSearchEnabled;
+  if (REALTIME_KEYWORDS.test(prompt)) return true;
+  if (CASUAL_OR_BUILD_ONLY.test(prompt)) return false;
+  return /\b(what|who|when|where|which|how much|how many|search|lookup|find)\b/i.test(
+    prompt
+  );
 }
 
 async function fetchLiveSearchContext(
   query: string,
   parentSignal: AbortSignal
 ): Promise<{ sources: LiveSource[]; groundedSummary: string }> {
-  const searchGuard = createLinkedTimeoutSignal(parentSignal, 4500);
+  const searchGuard = createLinkedTimeoutSignal(parentSignal, 2400);
   try {
     const res = await fetch('/api/search/live', {
       method: 'POST',
@@ -143,7 +132,7 @@ async function fetchLiveSearchContext(
   }
 
   // Client-side keyless backup search (Wikipedia + DuckDuckGo)
-  const backupGuard = createLinkedTimeoutSignal(parentSignal, 4500);
+  const backupGuard = createLinkedTimeoutSignal(parentSignal, 2400);
   try {
     const [wikiRes, ddgRes] = await Promise.all([
       fetch(
@@ -200,7 +189,7 @@ async function streamDirectOpenAISSE(
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   onToken: (token: string, engine: string) => void,
   parentSignal: AbortSignal,
-  connectTimeoutMs = 7000
+  connectTimeoutMs = 4500
 ): Promise<boolean> {
   const timeoutGuard = createLinkedTimeoutSignal(parentSignal, connectTimeoutMs);
 
@@ -319,67 +308,75 @@ async function streamDirectOpenAISSE(
 }
 
 async function directClientCloudFailover(
+  modelMode: ModelModeId,
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
   onToken: (token: string, engine: string) => void,
   parentSignal: AbortSignal
 ): Promise<string | null> {
-  // Browser Tier 1: Direct LLM7 SSE Stream (CORS *, zero API key, fast ~350ms TTFT)
-  try {
-    const ok = await streamDirectOpenAISSE(
-      'https://api.llm7.io/v1/chat/completions',
-      'fast',
-      'Direct Cloud (LLM7 Fast)',
-      messages,
-      onToken,
-      parentSignal,
-      7000
-    );
-    if (ok) return 'Direct Cloud (LLM7 Fast)';
-  } catch {
+  const OVH_URL = 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions';
+  const LLM7_URL = 'https://api.llm7.io/v1/chat/completions';
+  const POLL_URL = 'https://text.pollinations.ai/openai';
+
+  // CORS-enabled direct browser targets (runs from the user's own IP!)
+  const directTargets: Array<{ url: string; model: string; label: string }> =
+    modelMode === 'deepseek-r1'
+      ? [
+          { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'Direct OVH DeepSeek V4.1' },
+          { url: OVH_URL, model: 'gpt-oss-20b', label: 'Direct OVH GPT-OSS 20B' },
+          { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'Direct OVH Mistral 3.2' },
+          { url: LLM7_URL, model: 'DeepSeek-V4-Flash-0731', label: 'Direct LLM7 DeepSeek V4' },
+          { url: LLM7_URL, model: 'fast', label: 'Direct LLM7 Fast' },
+          { url: LLM7_URL, model: 'gemma4:31b', label: 'Direct LLM7 Gemma 4' },
+          { url: POLL_URL, model: 'openai-fast', label: 'Direct Pollinations' },
+        ]
+      : [
+          { url: OVH_URL, model: 'gpt-oss-20b', label: 'Direct OVH GPT-OSS 20B' },
+          { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'Direct OVH Mistral 3.2' },
+          { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'Direct OVH DeepSeek V4.1' },
+          { url: LLM7_URL, model: 'fast', label: 'Direct LLM7 Fast' },
+          { url: LLM7_URL, model: 'glm-5.3-flash', label: 'Direct LLM7 GLM-5.3' },
+          { url: LLM7_URL, model: 'gemma4:31b', label: 'Direct LLM7 Gemma 4' },
+          { url: POLL_URL, model: 'openai-fast', label: 'Direct Pollinations' },
+        ];
+
+  for (const target of directTargets) {
     if (parentSignal.aborted) throw new Error('Aborted');
+    let emitted = false;
+    try {
+      const ok = await streamDirectOpenAISSE(
+        target.url,
+        target.model,
+        target.label,
+        messages,
+        (tok, eng) => {
+          emitted = true;
+          onToken(tok, eng);
+        },
+        parentSignal,
+        4500
+      );
+      if (ok) return target.label;
+    } catch {
+      if (parentSignal.aborted) throw new Error('Aborted');
+      if (emitted) return target.label;
+    }
   }
 
-  // Browser Tier 2: Direct Pollinations OpenAI-compatible SSE Stream (active free model)
-  try {
-    const ok = await streamDirectOpenAISSE(
-      'https://text.pollinations.ai/openai',
-      'openai-fast',
-      'Direct Cloud (Pollinations)',
-      messages,
-      onToken,
-      parentSignal,
-      7000
-    );
-    if (ok) return 'Direct Cloud (Pollinations)';
-  } catch {
-    if (parentSignal.aborted) throw new Error('Aborted');
-  }
+  // Non-streaming Pollinations POST fallback (compact prompt)
+  const compactMessages = [
+    ...(messages[0]?.role === 'system'
+      ? [{ role: 'system' as const, content: messages[0].content.slice(0, 1200) }]
+      : []),
+    ...messages.filter((m) => m.role !== 'system').slice(-6),
+  ];
 
-  // Browser Tier 3: Automatic retry on LLM7 (default) after 1.1s rate-limit backoff
-  try {
-    await sleepAbortable(1100, parentSignal);
-    const ok = await streamDirectOpenAISSE(
-      'https://api.llm7.io/v1/chat/completions',
-      'default',
-      'Direct Cloud (LLM7 Default)',
-      messages,
-      onToken,
-      parentSignal,
-      8500
-    );
-    if (ok) return 'Direct Cloud (LLM7 Default)';
-  } catch {
-    if (parentSignal.aborted) throw new Error('Aborted');
-  }
-
-  // Browser Tier 4: Direct Pollinations POST Text Endpoint
-  const postGuard = createLinkedTimeoutSignal(parentSignal, 8500);
+  const postGuard = createLinkedTimeoutSignal(parentSignal, 6000);
   try {
     const postRes = await fetch('https://text.pollinations.ai/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages,
+        messages: compactMessages,
         model: 'openai-fast',
         private: true,
       }),
@@ -387,7 +384,7 @@ async function directClientCloudFailover(
     });
     if (postRes.ok) {
       const fullText = await postRes.text();
-      if (fullText.trim()) {
+      if (fullText.trim() && !fullText.includes('Free limit reached')) {
         onToken(fullText, 'Direct Pollinations POST');
         return 'Direct Pollinations POST';
       }
@@ -398,49 +395,8 @@ async function directClientCloudFailover(
     postGuard.clear();
   }
 
-  // Browser Tier 5: Non-streaming LLM7 retry
-  const llm7JsonGuard = createLinkedTimeoutSignal(parentSignal, 9500);
-  try {
-    const res = await fetch('https://api.llm7.io/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: 'default',
-        messages,
-        stream: false,
-      }),
-      signal: llm7JsonGuard.signal,
-    });
-    if (res.ok) {
-      const data = (await res.json()) as {
-        choices?: Array<{
-          message?: {
-            content?: string;
-            reasoning_content?: string;
-            reasoning?: string;
-          };
-        }>;
-      };
-      const msg = data.choices?.[0]?.message;
-      const content = msg?.content?.trim() || '';
-      const reasoning = (msg?.reasoning_content || msg?.reasoning || '').trim();
-      if (content) {
-        const combined =
-          reasoning && !content.includes('<think>')
-            ? `<think>\n${reasoning}\n</think>\n\n${content}`
-            : content;
-        onToken(combined, 'Direct Cloud (LLM7)');
-        return 'Direct Cloud (LLM7)';
-      }
-    }
-  } catch {
-    if (parentSignal.aborted) throw new Error('Aborted');
-  } finally {
-    llm7JsonGuard.clear();
-  }
-
-  // Browser Tier 6: Safe-length GET fallback to Pollinations
-  const getGuard = createLinkedTimeoutSignal(parentSignal, 8500);
+  // Safe-length GET fallback to Pollinations
+  const getGuard = createLinkedTimeoutSignal(parentSignal, 6000);
   try {
     const lastUser = (
       [...messages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
@@ -452,7 +408,7 @@ async function directClientCloudFailover(
     );
     if (textRes.ok) {
       const fullText = await textRes.text();
-      if (fullText.trim()) {
+      if (fullText.trim() && !fullText.includes('Free limit reached')) {
         onToken(fullText, 'Direct Pollinations Text');
         return 'Direct Pollinations Text';
       }
@@ -485,10 +441,7 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
   if (
     lastUserMsg &&
     modelMode !== 'local-webgpu' &&
-    (modelMode === 'searchgpt' ||
-      (liveSearchEnabled &&
-        (REALTIME_KEYWORDS.test(lastUserMsg) || lastUserMsg.trim().endsWith('?'))) ||
-      liveSearchEnabled)
+    shouldTriggerLiveSearch(lastUserMsg, modelMode, liveSearchEnabled)
   ) {
     const searchRes = await fetchLiveSearchContext(lastUserMsg, signal);
     liveSources = searchRes.sources;
@@ -531,7 +484,8 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
   let engineUsed = `Cloud Router (${modeOption.shortLabel})`;
   let gotAnyTokenFromBackend = false;
 
-  const backendConnectGuard = createLinkedTimeoutSignal(signal, 8500);
+  // Give backend waterfall 18s to emit its first token across OVH/Kilo/HF/LLM7 (clears immediately on first token)
+  const backendConnectGuard = createLinkedTimeoutSignal(signal, 18000);
   try {
     const res = await fetch('/api/ai/stream', {
       method: 'POST',
@@ -541,6 +495,7 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
       },
       body: JSON.stringify({
         model: modeOption.pollinationsModel,
+        mode: modelMode,
         messages: payloadMessages,
       }),
       signal: backendConnectGuard.signal,
@@ -607,13 +562,13 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
     backendConnectGuard.clear();
     if (signal.aborted) throw err;
 
-    // If backend already streamed partial output, keep what we have rather than duplicating
     if (gotAnyTokenFromBackend) {
       return engineUsed;
     }
 
-    // Instant client-side multi-tier keyless failover (handles 404, 5xx, static PWA, or slow backend)
+    // Instant client-side multi-tier keyless failover directly from user's browser (CORS * providers)
     const fallbackEngine = await directClientCloudFailover(
+      modelMode,
       payloadMessages,
       (token, eng) => {
         engineUsed = eng;
@@ -627,7 +582,7 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
     }
 
     throw new Error(
-      'Unable to reach free cloud AI endpoints right now. Please tap Regenerate or switch to Local WebGPU mode.'
+      'Unable to connect to cloud AI right now. Check your internet connection and tap Regenerate, or switch to Local WebGPU mode.'
     );
   } finally {
     backendConnectGuard.clear();

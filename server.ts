@@ -39,7 +39,7 @@ interface LiveSourceItem {
 
 async function fetchDuckDuckGo(query: string): Promise<LiveSourceItem[]> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+  const timer = setTimeout(() => controller.abort(), 2200);
   try {
     const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
     const res = await fetch(url, { signal: controller.signal });
@@ -108,7 +108,7 @@ async function fetchDuckDuckGo(query: string): Promise<LiveSourceItem[]> {
 
 async function fetchWikipedia(query: string): Promise<LiveSourceItem[]> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 5000);
+  const timer = setTimeout(() => controller.abort(), 2200);
   try {
     const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=3&format=json&origin=*`;
     const res = await fetch(searchUrl, {
@@ -228,24 +228,6 @@ function createLinkedTimeoutSignal(
   };
 }
 
-function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal.aborted) {
-      reject(new Error('Aborted'));
-      return;
-    }
-    const timer = setTimeout(() => {
-      signal.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new Error('Aborted'));
-    };
-    signal.addEventListener('abort', onAbort, { once: true });
-  });
-}
-
 function normalizePollinationsModel(requestedModel: string): string {
   // Only openai / openai-fast / gpt-oss-20b remain active on Classic Pollinations without 404
   const valid = new Set(['openai', 'openai-fast', 'gpt-oss', 'gpt-oss-20b']);
@@ -258,7 +240,7 @@ async function streamOpenAICompatible(
   messages: IncomingMessage[],
   onToken: (token: string) => void,
   parentSignal: AbortSignal,
-  connectTimeoutMs = 7000
+  connectTimeoutMs = 4500
 ): Promise<boolean> {
   const timeoutGuard = createLinkedTimeoutSignal(parentSignal, connectTimeoutMs);
 
@@ -381,45 +363,137 @@ async function streamOpenAICompatible(
   return emittedAny;
 }
 
-async function fetchLlm7NonStreaming(
-  model: string,
+async function streamHuggingFaceGemma4Space(
+  spaceHost: string,
   messages: IncomingMessage[],
-  parentSignal: AbortSignal
-): Promise<string> {
-  const timeoutGuard = createLinkedTimeoutSignal(parentSignal, 12000);
+  enableThinking: boolean,
+  onToken: (token: string) => void,
+  parentSignal: AbortSignal,
+  connectTimeoutMs = 5500
+): Promise<boolean> {
+  const timeoutGuard = createLinkedTimeoutSignal(parentSignal, connectTimeoutMs);
+
+  const systemPrompt = messages.find((m) => m.role === 'system')?.content || '';
+  const nonSystem = messages.filter((m) => m.role !== 'system');
+  const lastUser = [...nonSystem].reverse().find((m) => m.role === 'user')?.content || 'Hello';
+  const priorTurns = nonSystem.slice(0, -1).map((m) => ({
+    role: m.role,
+    content: m.content,
+  }));
+
   try {
-    const res = await fetch('https://api.llm7.io/v1/chat/completions', {
+    const postRes = await fetch(`${spaceHost}/gradio_api/call/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model,
-        messages,
-        stream: false,
+        data: [
+          lastUser,
+          null,
+          priorTurns,
+          enableThinking,
+          2048,
+          280,
+          systemPrompt,
+          0.7,
+          0.95,
+          64,
+          1,
+        ],
       }),
       signal: timeoutGuard.signal,
     });
-    if (!res.ok) {
-      throw new Error(`LLM7 non-stream HTTP ${res.status}`);
+    if (!postRes.ok) {
+      timeoutGuard.clear();
+      throw new Error(`HF Space POST HTTP ${postRes.status}`);
     }
-    const data = (await res.json()) as {
-      choices?: Array<{
-        message?: {
-          content?: string;
-          reasoning_content?: string;
-          reasoning?: string;
-        };
-      }>;
+    const { event_id } = (await postRes.json()) as { event_id?: string };
+    if (!event_id) {
+      timeoutGuard.clear();
+      throw new Error('Missing HF Space event_id');
+    }
+
+    const sseRes = await fetch(`${spaceHost}/gradio_api/call/chat/${event_id}`, {
+      signal: timeoutGuard.signal,
+    });
+    if (!sseRes.ok || !sseRes.body) {
+      timeoutGuard.clear();
+      throw new Error(`HF Space SSE HTTP ${sseRes.status}`);
+    }
+
+    const reader = sseRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let prevReasoningLen = 0;
+    let prevContentLen = 0;
+    let openedReasoning = false;
+    let closedReasoning = false;
+    let emittedAny = false;
+
+    const emit = (txt: string) => {
+      if (!txt) return;
+      if (!emittedAny) {
+        timeoutGuard.clear();
+        emittedAny = true;
+      }
+      onToken(txt);
     };
-    const msg = data.choices?.[0]?.message;
-    const content = msg?.content?.trim() || '';
-    const reasoning = (msg?.reasoning_content || msg?.reasoning || '').trim();
-    if (!content) {
-      throw new Error('Empty LLM7 response');
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const raw of lines) {
+        const line = raw.trim();
+        if (line.startsWith('event: error')) {
+          throw new Error('HF Space returned event: error');
+        }
+        if (!line.startsWith('data:')) continue;
+        const jsonStr = line.slice(5).trim();
+        if (!jsonStr || jsonStr === 'null') continue;
+        try {
+          const arr = JSON.parse(jsonStr) as Array<{
+            reasoning?: string;
+            content?: string;
+          }>;
+          const item = Array.isArray(arr) ? arr[0] : null;
+          if (!item) continue;
+          const rText = item.reasoning || '';
+          const cText = item.content || '';
+
+          if (rText.length > prevReasoningLen && !closedReasoning) {
+            if (!openedReasoning) {
+              openedReasoning = true;
+              if (!rText.trimStart().startsWith('<think>')) {
+                emit('<think>\n');
+              }
+            }
+            emit(rText.slice(prevReasoningLen));
+            prevReasoningLen = rText.length;
+          }
+
+          if (cText.length > prevContentLen) {
+            if (openedReasoning && !closedReasoning) {
+              closedReasoning = true;
+              if (!cText.trimStart().startsWith('</think>')) {
+                emit('\n</think>\n\n');
+              }
+            }
+            emit(cText.slice(prevContentLen));
+            prevContentLen = cText.length;
+          }
+        } catch {
+          // ignore partial frames
+        }
+      }
     }
-    if (reasoning && !content.includes('<think>')) {
-      return `<think>\n${reasoning}\n</think>\n\n${content}`;
+
+    if (openedReasoning && !closedReasoning) {
+      emit('</think>\n');
     }
-    return content;
+    return emittedAny;
   } finally {
     timeoutGuard.clear();
   }
@@ -429,13 +503,20 @@ async function fallbackPollinationsText(
   messages: IncomingMessage[],
   parentSignal: AbortSignal
 ): Promise<string> {
-  const postGuard = createLinkedTimeoutSignal(parentSignal, 9000);
+  const compactMessages: IncomingMessage[] = [
+    ...(messages[0]?.role === 'system'
+      ? [{ role: 'system' as const, content: messages[0].content.slice(0, 1200) }]
+      : []),
+    ...messages.filter((m) => m.role !== 'system').slice(-6),
+  ];
+
+  const postGuard = createLinkedTimeoutSignal(parentSignal, 5500);
   try {
     const res = await fetch('https://text.pollinations.ai/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        messages,
+        messages: compactMessages,
         model: 'openai-fast',
         private: true,
       }),
@@ -443,14 +524,13 @@ async function fallbackPollinationsText(
     });
     if (res.ok) {
       const text = await res.text();
-      if (text.trim()) return text;
+      if (text.trim() && !text.includes('Free limit reached')) return text;
     }
   } finally {
     postGuard.clear();
   }
 
-  // GET fallback with condensed prompt capped safely under URL length limits
-  const getGuard = createLinkedTimeoutSignal(parentSignal, 9000);
+  const getGuard = createLinkedTimeoutSignal(parentSignal, 5500);
   try {
     const lastUser = (
       [...messages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
@@ -464,8 +544,8 @@ async function fallbackPollinationsText(
       throw new Error(`Pollinations GET fallback HTTP ${getRes.status}`);
     }
     const text = await getRes.text();
-    if (!text.trim()) {
-      throw new Error('Empty Pollinations GET response');
+    if (!text.trim() || text.includes('Free limit reached')) {
+      throw new Error('Pollinations rate-limited');
     }
     return text;
   } finally {
@@ -622,8 +702,13 @@ async function startServer() {
 
   // Resilient Multi-Tier Keyless AI Streaming Router
   app.post('/api/ai/stream', async (req, res) => {
-    const { model = 'openai-fast', messages } = req.body as {
+    const {
+      model = 'openai-fast',
+      mode = 'auto',
+      messages,
+    } = req.body as {
       model?: string;
+      mode?: string;
       messages?: IncomingMessage[];
     };
 
@@ -650,76 +735,134 @@ async function startServer() {
       }
     };
 
-    const safePollinationsModel = normalizePollinationsModel(model);
+    interface ProviderTarget {
+      url: string;
+      model: string;
+      label: string;
+      timeoutMs?: number;
+    }
 
-    // Tier 1: Primary Instant SSE Stream — Pollinations OpenAI-compatible (active free model)
-    try {
-      const ok = await streamOpenAICompatible(
-        'https://text.pollinations.ai/openai',
-        safePollinationsModel,
-        messages,
-        (token) => sendEvent({ token, engine: `Pollinations (${safePollinationsModel})` }),
-        controller.signal,
-        7000
-      );
-      if (ok) {
-        sendEvent({ done: true, engine: `Pollinations (${safePollinationsModel})` });
-        res.end();
-        return;
-      }
-    } catch {
+    const OVH_URL = 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions';
+    const KILO_URL = 'https://api.kilo.ai/api/gateway/chat/completions';
+    const LLM7_URL = 'https://api.llm7.io/v1/chat/completions';
+    const POLL_URL = 'https://text.pollinations.ai/openai';
+
+    const providerChain: ProviderTarget[] =
+      mode === 'coder-pro'
+        ? [
+            { url: KILO_URL, model: 'kilo-auto/free', label: 'Kilo Auto Free' },
+            { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
+            { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
+            { url: KILO_URL, model: 'cohere/north-mini-code:free', label: 'Kilo NorthCode' },
+            { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
+            { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
+            { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
+            { url: LLM7_URL, model: 'glm-5.3-flash', label: 'LLM7 GLM-5.3 Flash' },
+          ]
+        : mode === 'deepseek-r1'
+          ? [
+              { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
+              { url: KILO_URL, model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', label: 'Kilo Nemotron Reasoning' },
+              { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
+              { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
+              { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
+              { url: LLM7_URL, model: 'DeepSeek-V4-Flash-0731', label: 'LLM7 DeepSeek V4' },
+              { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
+            ]
+          : [
+              { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
+              { url: KILO_URL, model: 'kilo-auto/free', label: 'Kilo Auto Free' },
+              { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
+              { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
+              { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
+              { url: KILO_URL, model: 'cohere/north-mini-code:free', label: 'Kilo NorthCode' },
+              { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
+              { url: LLM7_URL, model: 'glm-5.3-flash', label: 'LLM7 GLM-5.3 Flash' },
+            ];
+
+    // Add Pollinations Classic only near the end (since it enforces a 45s per-IP cooldown)
+    providerChain.push({
+      url: POLL_URL,
+      model: normalizePollinationsModel(model),
+      label: `Pollinations (${normalizePollinationsModel(model)})`,
+      timeoutMs: 4500,
+    });
+
+    for (const target of providerChain) {
       if (controller.signal.aborted) {
         res.end();
         return;
       }
+      let emittedFromTarget = false;
+      try {
+        const ok = await streamOpenAICompatible(
+          target.url,
+          target.model,
+          messages,
+          (token) => {
+            emittedFromTarget = true;
+            sendEvent({ token, engine: target.label });
+          },
+          controller.signal,
+          target.timeoutMs ?? 4500
+        );
+        if (ok) {
+          sendEvent({ done: true, engine: target.label });
+          res.end();
+          return;
+        }
+      } catch {
+        if (controller.signal.aborted || emittedFromTarget) {
+          if (emittedFromTarget) sendEvent({ done: true, engine: target.label });
+          res.end();
+          return;
+        }
+      }
     }
 
-    // Tier 2: Fast Keyless Backup SSE Stream — LLM7.io (fast)
-    try {
-      const ok = await streamOpenAICompatible(
-        'https://api.llm7.io/v1/chat/completions',
-        'fast',
-        messages,
-        (token) => sendEvent({ token, engine: 'LLM7 Cloud (fast)' }),
-        controller.signal,
-        7500
-      );
-      if (ok) {
-        sendEvent({ done: true, engine: 'LLM7 Cloud (fast)' });
-        res.end();
-        return;
-      }
-    } catch {
+    // Hugging Face Official Gemma 4 Space Fallback (12B -> 31B)
+    for (const space of [
+      {
+        host: 'https://huggingface-projects-gemma-4-12b-it.hf.space',
+        label: 'HuggingFace Gemma 4 12B',
+      },
+      {
+        host: 'https://huggingface-projects-gemma-4-31b-it.hf.space',
+        label: 'HuggingFace Gemma 4 31B',
+      },
+    ]) {
       if (controller.signal.aborted) {
         res.end();
         return;
       }
+      let emittedFromSpace = false;
+      try {
+        const ok = await streamHuggingFaceGemma4Space(
+          space.host,
+          messages,
+          mode === 'deepseek-r1',
+          (token) => {
+            emittedFromSpace = true;
+            sendEvent({ token, engine: space.label });
+          },
+          controller.signal,
+          5500
+        );
+        if (ok) {
+          sendEvent({ done: true, engine: space.label });
+          res.end();
+          return;
+        }
+      } catch {
+        if (controller.signal.aborted || emittedFromSpace) {
+          if (emittedFromSpace) sendEvent({ done: true, engine: space.label });
+          res.end();
+          return;
+        }
+      }
     }
 
-    // Tier 3: Automatic Retry with LLM7 (default) after short 1.1s rate-limit backoff
-    try {
-      await sleepAbortable(1100, controller.signal);
-      const ok = await streamOpenAICompatible(
-        'https://api.llm7.io/v1/chat/completions',
-        'default',
-        messages,
-        (token) => sendEvent({ token, engine: 'LLM7 Cloud (default)' }),
-        controller.signal,
-        8500
-      );
-      if (ok) {
-        sendEvent({ done: true, engine: 'LLM7 Cloud (default)' });
-        res.end();
-        return;
-      }
-    } catch {
-      if (controller.signal.aborted) {
-        res.end();
-        return;
-      }
-    }
-
-    // Tier 4: Pollinations POST / GET Text Fallback
+    // Pollinations POST / GET compact fallback
     try {
       const text = await fallbackPollinationsText(messages, controller.signal);
       if (text) {
@@ -735,52 +878,38 @@ async function startServer() {
       }
     }
 
-    // Tier 5: Non-streaming LLM7 retry
-    try {
-      const text = await fetchLlm7NonStreaming('default', messages, controller.signal);
-      if (text) {
-        sendEvent({ token: text, engine: 'LLM7 Cloud Failover' });
-        sendEvent({ done: true, engine: 'LLM7 Cloud Failover' });
+    // Gemini server-side fallback if configured
+    const ai = getGeminiClient();
+    if (ai) {
+      try {
+        const systemInstruction = messages.find((m) => m.role === 'system')?.content;
+        const userTurns = messages
+          .filter((m) => m.role !== 'system')
+          .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+          .join('\n\n');
+
+        const stream = await ai.models.generateContentStream({
+          model: 'gemini-4-hydrogen',
+          contents: userTurns,
+          config: systemInstruction ? { systemInstruction } : undefined,
+        });
+        for await (const chunk of stream) {
+          if (chunk.text) {
+            sendEvent({ token: chunk.text, engine: 'Gemini 4 Hydrogen' });
+          }
+        }
+        sendEvent({ done: true, engine: 'Gemini 4 Hydrogen' });
         res.end();
         return;
+      } catch {
+        // Fall through to final error
       }
-    } catch (err) {
-      // Tier 6: Gemini server-side fallback if configured
-      const ai = getGeminiClient();
-      if (ai) {
-        try {
-          const systemInstruction = messages.find((m) => m.role === 'system')?.content;
-          const userTurns = messages
-            .filter((m) => m.role !== 'system')
-            .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-            .join('\n\n');
-
-          const stream = await ai.models.generateContentStream({
-            model: 'gemini-4-hydrogen',
-            contents: userTurns,
-            config: systemInstruction ? { systemInstruction } : undefined,
-          });
-          for await (const chunk of stream) {
-            if (chunk.text) {
-              sendEvent({ token: chunk.text, engine: 'Gemini 4 Hydrogen' });
-            }
-          }
-          sendEvent({ done: true, engine: 'Gemini 4 Hydrogen' });
-          res.end();
-          return;
-        } catch {
-          // Fall through to final error
-        }
-      }
-
-      sendEvent({
-        error:
-          err instanceof Error
-            ? err.message
-            : 'All keyless cloud inference endpoints are temporarily busy.',
-      });
-      res.end();
     }
+
+    sendEvent({
+      error: 'All keyless cloud inference endpoints are temporarily busy.',
+    });
+    res.end();
   });
 
   if (!IS_PROD) {

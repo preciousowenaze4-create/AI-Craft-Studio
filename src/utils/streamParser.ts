@@ -52,13 +52,45 @@ export function parseThinkingContent(raw: string): ParsedThinkResult {
     };
   }
 
-  const thinkContent = afterOpen.slice(0, closeIdx).trim();
-  const answerContent = afterOpen.slice(closeIdx + closeTag.length).trimStart();
+  let thinkContent = afterOpen.slice(0, closeIdx).trim();
+  let answerContent = afterOpen.slice(closeIdx + closeTag.length).trimStart();
+
+  // If a reasoning model emitted native reasoning AND also included <think>...</think> in content, fold cleanly
+  while (answerContent.startsWith(openTag) || answerContent.startsWith(closeTag)) {
+    if (answerContent.startsWith(closeTag)) {
+      answerContent = answerContent.slice(closeTag.length).trimStart();
+      continue;
+    }
+    const innerAfter = answerContent.slice(openTag.length);
+    const innerClose = innerAfter.indexOf(closeTag);
+    if (innerClose === -1) {
+      let partial = innerAfter;
+      for (let i = closeTag.length - 1; i >= 1; i--) {
+        if (partial.endsWith(closeTag.slice(0, i))) {
+          partial = partial.slice(0, -i);
+          break;
+        }
+      }
+      thinkContent = [thinkContent, partial.trim()].filter(Boolean).join('\n\n');
+      return {
+        thinkContent,
+        answerContent: '',
+        isThinking: true,
+        detectedIntent: extractIntent(thinkContent),
+      };
+    }
+    const extraThink = innerAfter.slice(0, innerClose).trim();
+    if (extraThink) {
+      thinkContent = [thinkContent, extraThink].filter(Boolean).join('\n\n');
+    }
+    answerContent = innerAfter.slice(innerClose + closeTag.length).trimStart();
+  }
+
   return {
     thinkContent,
     answerContent,
     isThinking: false,
-    detectedIntent: extractIntent(thinkContent),
+    detectedIntent: extractIntent(thinkContent) || extractIntent(answerContent),
   };
 }
 
