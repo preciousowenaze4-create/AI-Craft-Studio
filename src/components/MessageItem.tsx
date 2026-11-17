@@ -20,6 +20,7 @@ import {
 } from '../utils/speech';
 import { ThinkingAccordion } from './ThinkingAccordion';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import { TierEmblem, getTierVisual } from './TierEmblem';
 
 interface MessageItemProps {
   message: ChatMessage;
@@ -219,9 +220,22 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(
       minute: '2-digit',
     }).format(new Date(message.createdAt));
 
+    const tierVisual = getTierVisual(message.modelMode);
+
     return (
       <div className="flex justify-start group">
         <div className="w-full max-w-4xl space-y-2">
+          {/* Assistant Tier Header with Color-Coded "A" Emblem */}
+          <div className="flex items-center gap-2">
+            <TierEmblem mode={message.modelMode || 'auto'} size="xs" />
+            <span className={`text-xs font-semibold ${tierVisual.accentText}`}>
+              {tierVisual.name}
+            </span>
+            <span className="text-[11px] text-zinc-500">
+              {tierVisual.tag}
+            </span>
+          </div>
+
           {/* Live Source Citations above AI response */}
           {message.sources && message.sources.length > 0 && (
             <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-3 space-y-2">
@@ -279,6 +293,7 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(
             <div className="text-zinc-100">
               <MarkdownRenderer
                 content={parsed.answerContent}
+                isStreaming={isStreaming}
                 onExportTableToSheets={onExportTableToSheets}
               />
             </div>

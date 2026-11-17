@@ -283,7 +283,8 @@ async function streamOpenAICompatible(
   messages: IncomingMessage[],
   onToken: (token: string) => void,
   parentSignal: AbortSignal,
-  connectTimeoutMs = 4500
+  connectTimeoutMs = 4500,
+  tuning?: { maxTokens?: number; temperature?: number }
 ): Promise<boolean> {
   const timeoutGuard = createLinkedTimeoutSignal(parentSignal, connectTimeoutMs);
 
@@ -299,6 +300,10 @@ async function streamOpenAICompatible(
         model,
         messages,
         stream: true,
+        ...(tuning?.maxTokens ? { max_tokens: tuning.maxTokens } : {}),
+        ...(typeof tuning?.temperature === 'number'
+          ? { temperature: tuning.temperature }
+          : {}),
       }),
       signal: timeoutGuard.signal,
     });
@@ -576,25 +581,40 @@ async function fallbackPollinationsText(
   }
 
   const getGuard = createLinkedTimeoutSignal(parentSignal, 5500);
+  const lastUser = (
+    [...textMessages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
+  ).slice(0, 900);
+  const systemMsg = (
+    textMessages.find((m) => m.role === 'system')?.content || ''
+  ).slice(0, 500);
+
   try {
-    const lastUser = (
-      [...textMessages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
-    ).slice(0, 900);
-    const systemMsg = (
-      textMessages.find((m) => m.role === 'system')?.content || ''
-    ).slice(0, 500);
     const getUrl = `https://text.pollinations.ai/${encodeURIComponent(lastUser)}?model=openai-fast&system=${encodeURIComponent(systemMsg)}`;
     const getRes = await fetch(getUrl, { signal: getGuard.signal });
-    if (!getRes.ok) {
-      throw new Error(`Pollinations GET fallback HTTP ${getRes.status}`);
+    if (getRes.ok) {
+      const text = await getRes.text();
+      if (text.trim() && !text.includes('Free limit reached')) return text;
     }
-    const text = await getRes.text();
-    if (!text.trim() || text.includes('Free limit reached')) {
+  } catch {
+    if (parentSignal.aborted) throw new Error('Aborted');
+  } finally {
+    getGuard.clear();
+  }
+
+  const genGuard = createLinkedTimeoutSignal(parentSignal, 5500);
+  try {
+    const genUrl = `https://gen.pollinations.ai/text/${encodeURIComponent(lastUser)}?system=${encodeURIComponent(systemMsg)}`;
+    const genRes = await fetch(genUrl, { signal: genGuard.signal });
+    if (!genRes.ok) {
+      throw new Error(`Gen Pollinations GET fallback HTTP ${genRes.status}`);
+    }
+    const text = await genRes.text();
+    if (!text.trim() || text.startsWith('{"success":false') || text.includes('Free limit reached')) {
       throw new Error('Pollinations rate-limited');
     }
     return text;
   } finally {
-    getGuard.clear();
+    genGuard.clear();
   }
 }
 
@@ -750,10 +770,14 @@ async function startServer() {
     const {
       model = 'openai-fast',
       mode = 'auto',
+      maxTokens,
+      temperature,
       messages,
     } = req.body as {
       model?: string;
       mode?: string;
+      maxTokens?: number;
+      temperature?: number;
       messages?: IncomingMessage[];
     };
 
@@ -805,42 +829,60 @@ async function startServer() {
           { url: OVH_URL, model: 'gemma-4-26b-a4b', label: 'OVH Gemma 4 26B Vision', timeoutMs: 7000, supportsVision: true },
           { url: KILO_URL, model: 'openrouter/free', label: 'Kilo OpenRouter Free Vision', timeoutMs: 8000, supportsVision: true },
         ]
-      : mode === 'coder-pro'
+      : mode === 'deepseek-r1'
         ? [
-            { url: KILO_URL, model: 'kilo-auto/free', label: 'Kilo Auto Free' },
-            { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B' },
-            { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B Coder' },
-            { url: KILO_URL, model: 'cohere/north-mini-code:free', label: 'Kilo NorthCode' },
-            { url: OVH_URL, model: 'Qwen3.5-397B-A17B', label: 'OVH Qwen3.5 397B' },
-            { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
-            { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
-            { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
-            { url: LLM7_URL, model: 'codestral-latest', label: 'LLM7 Codestral' },
-            { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
+            { url: OVH_URL, model: 'Qwen3.5-397B-A17B', label: 'AI Craft Max · Qwen3.5 397B', timeoutMs: 7000 },
+            { url: KILO_URL, model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', label: 'AI Craft Max · Nemotron Reasoning' },
+            { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'AI Craft Max · DeepSeek V4.1' },
+            { url: OVH_URL, model: 'gpt-oss-120b', label: 'AI Craft Max · GPT-OSS 120B' },
+            { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'AI Craft Max · Nemotron Lightning' },
+            { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'AI Craft Max · Qwen3.6 35B' },
+            { url: LLM7_URL, model: 'DeepSeek-V4-Flash-0731', label: 'AI Craft Max · LLM7 DeepSeek' },
+            { url: LLM7_URL, model: 'fast', label: 'AI Craft Max · LLM7 Cloud' },
           ]
-        : mode === 'deepseek-r1'
+        : mode === 'coder-pro'
           ? [
-              { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
-              { url: KILO_URL, model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', label: 'Kilo Nemotron Reasoning' },
-              { url: OVH_URL, model: 'Qwen3.5-397B-A17B', label: 'OVH Qwen3.5 397B' },
-              { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B' },
-              { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
-              { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B' },
-              { url: LLM7_URL, model: 'DeepSeek-V4-Flash-0731', label: 'LLM7 DeepSeek V4' },
-              { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
+              { url: KILO_URL, model: 'kilo-auto/free', label: 'AI Craft Pro · Kilo Auto' },
+              { url: OVH_URL, model: 'gpt-oss-120b', label: 'AI Craft Pro · GPT-OSS 120B' },
+              { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'AI Craft Pro · Qwen3.6 Coder' },
+              { url: KILO_URL, model: 'cohere/north-mini-code:free', label: 'AI Craft Pro · NorthCode' },
+              { url: OVH_URL, model: 'Qwen3.5-397B-A17B', label: 'AI Craft Pro · Qwen3.5 397B' },
+              { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'AI Craft Pro · Mistral 3.2' },
+              { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'AI Craft Pro · Nemotron' },
+              { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'AI Craft Pro · DeepSeek V4.1' },
+              { url: LLM7_URL, model: 'codestral-latest', label: 'AI Craft Pro · LLM7 Codestral' },
+              { url: LLM7_URL, model: 'fast', label: 'AI Craft Pro · LLM7 Cloud' },
             ]
-          : [
-              { url: KILO_URL, model: 'kilo-auto/free', label: 'Kilo Auto Free' },
-              { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
-              { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B' },
-              { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
-              { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B' },
-              { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
-              { url: KILO_URL, model: 'cohere/north-mini-code:free', label: 'Kilo NorthCode' },
-              { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
-              { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
-              { url: LLM7_URL, model: 'glm-5.3-flash', label: 'LLM7 GLM-5.3 Flash' },
-            ];
+          : mode === 'keyless-unlimited'
+            ? [
+                { url: OVH_URL, model: 'gpt-oss-20b', label: 'AI Craft Flash · GPT-OSS 20B', timeoutMs: 3600 },
+                { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'AI Craft Flash · Nemotron Lightning', timeoutMs: 4000 },
+                { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'AI Craft Flash · Mistral 3.2', timeoutMs: 4000 },
+                { url: KILO_URL, model: 'kilo-auto/free', label: 'AI Craft Flash · Kilo Auto', timeoutMs: 4500 },
+                { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'AI Craft Flash · Qwen3.6 35B' },
+                { url: LLM7_URL, model: 'fast', label: 'AI Craft Flash · LLM7 Fast' },
+              ]
+              : mode === 'searchgpt'
+                ? [
+                    { url: KILO_URL, model: 'kilo-auto/free', label: 'AI Craft Plus · Kilo Live Research' },
+                    { url: OVH_URL, model: 'gpt-oss-120b', label: 'AI Craft Plus · GPT-OSS 120B' },
+                    { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'AI Craft Plus · Mistral 3.2' },
+                    { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'AI Craft Plus · Nemotron' },
+                    { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'AI Craft Plus · Qwen3.6 35B' },
+                    { url: LLM7_URL, model: 'fast', label: 'AI Craft Plus · LLM7 Cloud' },
+                  ]
+                : [
+                    { url: KILO_URL, model: 'kilo-auto/free', label: 'AI Craft Studio · Kilo Auto' },
+                    { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'AI Craft Studio · Qwen3.6 35B' },
+                    { url: OVH_URL, model: 'gpt-oss-20b', label: 'AI Craft Studio · GPT-OSS 20B' },
+                    { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'AI Craft Studio · Nemotron' },
+                    { url: OVH_URL, model: 'gpt-oss-120b', label: 'AI Craft Studio · GPT-OSS 120B' },
+                    { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'AI Craft Studio · Mistral 3.2' },
+                    { url: KILO_URL, model: 'cohere/north-mini-code:free', label: 'AI Craft Studio · NorthCode' },
+                    { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'AI Craft Studio · DeepSeek V4.1' },
+                    { url: LLM7_URL, model: 'fast', label: 'AI Craft Studio · LLM7 Cloud' },
+                    { url: LLM7_URL, model: 'glm-5.3-flash', label: 'AI Craft Studio · LLM7 GLM-5.3' },
+                  ];
 
     if (!withImages) {
       // Add Pollinations Classic only near the end (since it enforces a 45s per-IP cooldown)
@@ -851,6 +893,11 @@ async function startServer() {
         timeoutMs: 4500,
       });
     }
+
+    const requestTuning = {
+      maxTokens: typeof maxTokens === 'number' ? maxTokens : undefined,
+      temperature: typeof temperature === 'number' ? temperature : undefined,
+    };
 
     for (const target of providerChain) {
       if (controller.signal.aborted) {
@@ -870,7 +917,8 @@ async function startServer() {
             sendEvent({ token, engine: target.label });
           },
           controller.signal,
-          target.timeoutMs ?? 5000
+          target.timeoutMs ?? 5000,
+          requestTuning
         );
         if (ok) {
           sendEvent({ done: true, engine: target.label });

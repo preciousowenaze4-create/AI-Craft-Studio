@@ -9,7 +9,6 @@ import {
   ArrowDown,
   ChevronDown,
   Code2,
-  Cpu,
   FileSpreadsheet,
   Globe,
   ImagePlus,
@@ -34,6 +33,7 @@ import type {
   PersonaRule,
 } from './types';
 import { MODEL_MODES, runChatStream } from './services/aiRouter';
+import { LOCAL_MODEL_OPTIONS, type LocalModelKey } from './services/localAi';
 import { parseThinkingContent } from './utils/streamParser';
 import { processImageFile } from './utils/imageResize';
 import { useVoiceInput } from './hooks/useVoiceInput';
@@ -42,11 +42,13 @@ import { Sidebar } from './components/Sidebar';
 import { MapsExplorerModal } from './components/MapsExplorerModal';
 import { SheetsWorkspaceModal } from './components/SheetsWorkspaceModal';
 import { BrandLogo } from './components/BrandLogo';
+import { TierEmblem } from './components/TierEmblem';
 import { PWAInstallButton } from './components/PWAInstallButton';
 
 const CHATS_STORAGE_KEY = 'vektor_chats_v1';
 const RULES_STORAGE_KEY = 'vektor_persona_rules_v1';
 const MODE_STORAGE_KEY = 'vektor_model_mode_v1';
+const LOCAL_MODEL_STORAGE_KEY = 'vektor_local_model_key_v1';
 
 function createNewChat(): ChatSession {
   const now = Date.now();
@@ -123,6 +125,10 @@ export default function App() {
   const [modelMode, setModelMode] = useState<ModelModeId>(() => {
     const saved = localStorage.getItem(MODE_STORAGE_KEY) as ModelModeId | null;
     return saved && MODEL_MODES.some((m) => m.id === saved) ? saved : 'auto';
+  });
+  const [localModelKey, setLocalModelKey] = useState<LocalModelKey>(() => {
+    const saved = localStorage.getItem(LOCAL_MODEL_STORAGE_KEY) as LocalModelKey | null;
+    return saved && LOCAL_MODEL_OPTIONS.some((m) => m.id === saved) ? saved : 'qwen-coder';
   });
   const [liveSearchEnabled, setLiveSearchEnabled] = useState(true);
 
@@ -205,6 +211,13 @@ export default function App() {
     [modelMode]
   );
 
+  const activeLocalOption = useMemo(
+    () =>
+      LOCAL_MODEL_OPTIONS.find((m) => m.id === localModelKey) ||
+      LOCAL_MODEL_OPTIONS[0],
+    [localModelKey]
+  );
+
   // Persist chats, persona rules, and model mode (gracefully trims older image payloads on QuotaExceededError)
   useEffect(() => {
     try {
@@ -240,6 +253,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(MODE_STORAGE_KEY, modelMode);
   }, [modelMode]);
+
+  useEffect(() => {
+    localStorage.setItem(LOCAL_MODEL_STORAGE_KEY, localModelKey);
+  }, [localModelKey]);
 
   // Listen for Case A Demo Key quota exceeded event
   useEffect(() => {
@@ -332,6 +349,7 @@ export default function App() {
       try {
         const finalEngine = await runChatStream({
           modelMode,
+          localModelKey,
           history: historyMessages.map((m) => ({
             role: m.role,
             content: m.content,
@@ -447,7 +465,7 @@ export default function App() {
         abortControllerRef.current = null;
       }
     },
-    [modelMode, liveSearchEnabled, personaRules, scrollToBottom]
+    [modelMode, localModelKey, liveSearchEnabled, personaRules, scrollToBottom]
   );
 
   const handleAddImageFiles = useCallback(
@@ -699,8 +717,8 @@ export default function App() {
       )}
 
       {/* Top Header (Shifted down on mobile with iPhone safe-area top padding for thumb reachability) */}
-      <header className="shrink-0 border-b border-zinc-800/80 bg-[#09090b]/95 pt-[max(1.5rem,calc(env(safe-area-inset-top)+1rem))] pb-2.5 sm:py-0 sm:h-14 px-3 sm:px-4 flex items-center justify-between gap-2.5 sm:gap-3">
-        <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
+      <header className="shrink-0 border-b border-zinc-800/80 bg-[#09090b]/95 pt-[max(1.35rem,calc(env(safe-area-inset-top)+0.85rem))] pb-2.5 sm:py-0 sm:h-14 px-3 sm:px-4 flex flex-wrap sm:flex-nowrap items-center justify-between gap-x-2 gap-y-2">
+        <div className="order-1 flex items-center gap-2 sm:gap-2.5 min-w-0">
           <button
             type="button"
             onClick={() => setSidebarOpen(true)}
@@ -710,61 +728,135 @@ export default function App() {
             <Menu className="w-5 h-5" />
           </button>
 
-          <div className="flex items-center gap-2 sm:gap-2.5 min-w-0">
-            <BrandLogo className="w-8 h-8 shrink-0" />
-            <span className="text-sm sm:text-base font-bold tracking-tight text-zinc-100 whitespace-nowrap truncate">
+          <div className="flex items-center gap-2 sm:gap-2.5 shrink-0">
+            <BrandLogo className="w-7 h-7 sm:w-8 sm:h-8 shrink-0" />
+            <span className="text-[15px] sm:text-base font-bold tracking-tight text-zinc-100 whitespace-nowrap">
               AI Craft Studio
             </span>
           </div>
         </div>
 
-        {/* Center/Right Controls */}
-        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
-          {/* Model & Mode Switcher */}
-          <div className="relative" ref={modeMenuRef}>
-            <button
-              type="button"
-              onClick={() => setModeMenuOpen((prev) => !prev)}
-              className="min-h-[40px] sm:min-h-0 inline-flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 rounded-lg border border-zinc-800 bg-[#18181b] hover:border-zinc-700 text-xs font-medium text-zinc-200 transition-colors cursor-pointer whitespace-nowrap shrink-0"
-            >
-              <Cpu className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
-              <span className="max-w-[96px] sm:max-w-[200px] truncate">
-                {currentModeOption.shortLabel}
+        {/* Model & Mode Switcher (left-aligned below brand on mobile for easy thumb access, inline on sm+ desktop) */}
+        <div
+          className="order-3 sm:order-2 w-full sm:w-auto sm:ml-auto relative flex items-center"
+          ref={modeMenuRef}
+        >
+          <button
+            type="button"
+            onClick={() => setModeMenuOpen((prev) => !prev)}
+            className="min-h-[40px] sm:min-h-0 w-full sm:w-auto inline-flex items-center justify-between sm:justify-start gap-2 px-3 py-1.5 rounded-xl sm:rounded-lg border border-zinc-700/70 bg-zinc-900/75 hover:border-zinc-600 text-xs font-medium text-zinc-100 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+            aria-label="Switch AI Craft model tier"
+          >
+            <span className="inline-flex items-center gap-2 min-w-0">
+              <TierEmblem mode={modelMode} size="xs" />
+              <span className="font-semibold text-zinc-100 truncate">
+                {currentModeOption.label}
               </span>
-              <ChevronDown className="w-3.5 h-3.5 text-zinc-500 shrink-0" />
-            </button>
+              <span className="text-[11px] font-medium text-zinc-400 shrink-0">
+                {modelMode === 'local-webgpu'
+                  ? `${activeLocalOption.sizeLabel} · Local`
+                  : currentModeOption.rankBadge}
+              </span>
+            </span>
+            <ChevronDown className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+          </button>
 
-            {modeMenuOpen && (
-              <div className="absolute right-0 mt-2 w-80 max-w-[90vw] rounded-xl border border-zinc-800 bg-[#18181b] shadow-xl p-1.5 z-50">
-                {MODEL_MODES.map((opt) => {
-                  const active = opt.id === modelMode;
-                  return (
-                    <button
-                      key={opt.id}
-                      type="button"
-                      onClick={() => {
-                        setModelMode(opt.id);
+          {modeMenuOpen && (
+            <div className="absolute left-0 top-full mt-1.5 sm:left-auto sm:right-0 w-[min(340px,calc(100vw-1.5rem))] sm:w-88 max-h-[40dvh] sm:max-h-[52dvh] overflow-y-auto overscroll-contain rounded-2xl border border-white/15 bg-zinc-900/65 backdrop-blur-xl shadow-2xl p-1.5 z-50">
+              {MODEL_MODES.map((opt) => {
+                const active = opt.id === modelMode;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => {
+                      setModelMode(opt.id);
+                      if (opt.id !== 'local-webgpu') {
                         setModeMenuOpen(false);
-                      }}
-                      className={`w-full text-left px-3 py-2.5 rounded-lg transition-colors cursor-pointer ${
-                        active
-                          ? 'bg-indigo-600/15 border border-indigo-500/30'
-                          : 'hover:bg-zinc-800/70 border border-transparent'
-                      }`}
-                    >
-                      <div className="text-xs font-semibold text-zinc-100">
-                        {opt.label}
+                      }
+                    }}
+                    className={`w-full text-left px-2.5 py-2 rounded-xl transition-colors cursor-pointer flex items-start gap-2.5 ${
+                      active
+                        ? 'bg-indigo-500/20 border border-indigo-400/40'
+                        : 'hover:bg-white/10 border border-transparent'
+                    }`}
+                  >
+                    <TierEmblem mode={opt.id} size="sm" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-xs font-semibold text-zinc-100 truncate">
+                          {opt.label}
+                        </span>
+                        {opt.rankBadge && (
+                          <span className="text-[10px] font-medium text-zinc-300 whitespace-nowrap shrink-0">
+                            {opt.id === 'local-webgpu'
+                              ? `${activeLocalOption.sizeLabel} · Local`
+                              : opt.rankBadge}
+                          </span>
+                        )}
                       </div>
-                      <div className="text-[11px] text-zinc-400 mt-0.5">
+                      <div className="text-[11px] text-zinc-300/90 mt-0.5 leading-snug">
                         {opt.description}
                       </div>
-                    </button>
-                  );
-                })}
-              </div>
-            )}
-          </div>
+                    </div>
+                  </button>
+                );
+              })}
 
+              <div className="mt-1.5 pt-2 px-2 pb-1 border-t border-white/10 space-y-1.5">
+                <div className="flex items-center justify-between gap-2 text-[11px] font-medium text-zinc-300">
+                  <span className="flex items-center gap-1.5 truncate">
+                    <TierEmblem mode="local-webgpu" size="xs" />
+                    <span className="truncate">
+                      AI Craft Mini · Browser Cached (WebGPU/WASM)
+                    </span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setModeMenuOpen(false)}
+                    className="text-indigo-300 hover:text-indigo-200 cursor-pointer shrink-0"
+                  >
+                    Done
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 gap-1">
+                  {LOCAL_MODEL_OPTIONS.map((lm) => {
+                    const selected = lm.id === localModelKey;
+                    return (
+                      <button
+                        key={lm.id}
+                        type="button"
+                        onClick={() => {
+                          setLocalModelKey(lm.id);
+                          setModelMode('local-webgpu');
+                          setModeMenuOpen(false);
+                        }}
+                        className={`w-full text-left px-2.5 py-1.5 rounded-xl border text-[11px] transition-colors cursor-pointer ${
+                          selected
+                            ? 'bg-indigo-500/20 border-indigo-400/40 text-zinc-100'
+                            : 'bg-zinc-950/35 border-white/10 text-zinc-300 hover:text-zinc-100 hover:bg-white/10'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 font-semibold">
+                          <span className="truncate">{lm.label}</span>
+                          <span className="text-[10px] font-medium text-zinc-300 shrink-0">
+                            {lm.sizeLabel}
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-zinc-400 mt-0.5">
+                          {lm.description}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Right Quick Action Controls */}
+        <div className="order-2 sm:order-3 flex items-center gap-1.5 sm:gap-2 shrink-0">
           <button
             type="button"
             onClick={() => setMapsOpen(true)}
@@ -799,8 +891,8 @@ export default function App() {
         </div>
       </header>
 
-      {/* Local Browser AI Download Progress Bar */}
-      {modelMode === 'local-webgpu' && localProgress.status === 'loading' && (
+      {/* Local Browser AI Download / Cache Initialization Progress Bar */}
+      {localProgress.status === 'loading' && (
         <div className="px-4 py-2 border-b border-zinc-800 bg-zinc-900/70 shrink-0">
           <div className="max-w-4xl mx-auto flex items-center justify-between gap-3 text-xs">
             <span className="text-zinc-300 truncate">{localProgress.text}</span>

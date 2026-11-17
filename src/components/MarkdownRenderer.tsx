@@ -5,6 +5,7 @@ import { CodeBlock } from './CodeBlock';
 
 interface MarkdownRendererProps {
   content: string;
+  isStreaming?: boolean;
   onExportTableToSheets?: (rows: string[][]) => void;
 }
 
@@ -260,14 +261,20 @@ function renderTextBlock(
 }
 
 export const MarkdownRenderer: React.FC<MarkdownRendererProps> = React.memo(
-  ({ content, onExportTableToSheets }) => {
+  ({ content, isStreaming = false, onExportTableToSheets }) => {
     const segments = splitMarkdownSegments(content);
 
     return (
       <div className="space-y-1">
         {segments.map((seg, idx) =>
           seg.type === 'code' ? (
-            <CodeBlock key={idx} code={seg.content} language={seg.language} />
+            <CodeBlock
+              key={idx}
+              code={seg.content}
+              language={seg.language}
+              isClosed={seg.isClosed}
+              isStreaming={isStreaming}
+            />
           ) : (
             <React.Fragment key={idx}>
               {renderTextBlock(seg.content, onExportTableToSheets)}

@@ -1,5 +1,6 @@
 export type ModelModeId =
   | 'auto'
+  | 'keyless-unlimited'
   | 'deepseek-r1'
   | 'searchgpt'
   | 'coder-pro'
@@ -9,6 +10,7 @@ export interface ModelModeOption {
   id: ModelModeId;
   label: string;
   shortLabel: string;
+  rankBadge?: string;
   description: string;
   pollinationsModel: string;
 }

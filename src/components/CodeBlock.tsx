@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   Code2,
@@ -13,6 +13,8 @@ import {
 interface CodeBlockProps {
   code: string;
   language?: string;
+  isClosed?: boolean;
+  isStreaming?: boolean;
 }
 
 const PREVIEWABLE_LANGS = new Set([
@@ -152,15 +154,30 @@ function tokenizeLine(line: string): Array<{ text: string; cls: string }> {
   return tokens;
 }
 
+const AUTO_PREVIEW_LANGS = new Set(['html', 'htm', 'jsx', 'tsx', 'svg']);
+
 export const CodeBlock: React.FC<CodeBlockProps> = React.memo(
-  ({ code, language = 'text' }) => {
+  ({ code, language = 'text', isClosed = true, isStreaming = false }) => {
     const [copied, setCopied] = useState(false);
-    const [showPreview, setShowPreview] = useState(false);
     const [isExpanded, setIsExpanded] = useState(false);
 
     const normalizedLang = language.toLowerCase() || 'text';
     const isPreviewable = PREVIEWABLE_LANGS.has(normalizedLang);
     const lines = useMemo(() => code.split('\n'), [code]);
+
+    const isCompleteRunnableApp =
+      AUTO_PREVIEW_LANGS.has(normalizedLang) &&
+      (isClosed || !isStreaming) &&
+      (lines.length >= 4 || /<[a-zA-Z]/.test(code));
+
+    const [showPreview, setShowPreview] = useState<boolean>(isCompleteRunnableApp);
+    const userToggledRef = useRef(false);
+
+    useEffect(() => {
+      if (!userToggledRef.current && isCompleteRunnableApp) {
+        setShowPreview(true);
+      }
+    }, [isCompleteRunnableApp]);
 
     const sandboxHtml = useMemo(() => {
       if (!showPreview) return '';
@@ -208,7 +225,10 @@ export const CodeBlock: React.FC<CodeBlockProps> = React.memo(
             {isPreviewable && (
               <button
                 type="button"
-                onClick={() => setShowPreview((prev) => !prev)}
+                onClick={() => {
+                  userToggledRef.current = true;
+                  setShowPreview((prev) => !prev);
+                }}
                 className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   showPreview
                     ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/40'
@@ -242,7 +262,7 @@ export const CodeBlock: React.FC<CodeBlockProps> = React.memo(
             <button
               type="button"
               onClick={handleCopy}
-              className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium text-zinc-200 bg-zinc-800/80 hover:text-white hover:bg-zinc-700 border border-zinc-700/80 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               title="Copy code"
             >
               {copied ? (
@@ -253,7 +273,7 @@ export const CodeBlock: React.FC<CodeBlockProps> = React.memo(
               ) : (
                 <>
                   <Copy className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Copy</span>
+                  <span>Copy Code</span>
                 </>
               )}
             </button>
@@ -293,15 +313,32 @@ export const CodeBlock: React.FC<CodeBlockProps> = React.memo(
                 : 'border-t border-zinc-800 bg-zinc-950'
             }
           >
-            <div className="flex items-center justify-between px-3.5 py-2 border-b border-zinc-800 bg-zinc-900/80">
-              <span className="text-xs font-medium text-zinc-300">
+            <div className="flex items-center justify-between gap-2 px-3.5 py-2 border-b border-zinc-800 bg-zinc-900/80">
+              <span className="text-xs font-medium text-zinc-300 truncate">
                 Interactive Live Preview Sandbox
               </span>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleCopy}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium text-zinc-200 bg-zinc-800 hover:bg-zinc-700 border border-zinc-700 transition-colors cursor-pointer whitespace-nowrap"
+                >
+                  {copied ? (
+                    <>
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                      <span className="text-emerald-400">Copied</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Code</span>
+                    </>
+                  )}
+                </button>
                 <button
                   type="button"
                   onClick={() => setIsExpanded((prev) => !prev)}
-                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-zinc-300 hover:text-white hover:bg-zinc-800 transition-colors cursor-pointer whitespace-nowrap"
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium text-zinc-200 bg-zinc-800 hover:text-white hover:bg-zinc-700 border border-zinc-700 transition-colors cursor-pointer whitespace-nowrap"
                 >
                   {isExpanded ? (
                     <>
@@ -311,7 +348,7 @@ export const CodeBlock: React.FC<CodeBlockProps> = React.memo(
                   ) : (
                     <>
                       <Maximize2 className="w-3.5 h-3.5" />
-                      <span>Expand</span>
+                      <span>Full-Screen Preview</span>
                     </>
                   )}
                 </button>

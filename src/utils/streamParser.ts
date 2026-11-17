@@ -104,6 +104,7 @@ export interface MarkdownSegment {
   type: 'text' | 'code';
   content: string;
   language?: string;
+  isClosed?: boolean;
 }
 
 export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
@@ -127,6 +128,7 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
         type: 'code',
         language: currentLang,
         content: buffer.join('\n'),
+        isClosed: true,
       });
       buffer = [];
       inCode = false;
@@ -143,6 +145,7 @@ export function splitMarkdownSegments(markdown: string): MarkdownSegment[] {
         type: 'code',
         language: currentLang,
         content: buffer.join('\n'),
+        isClosed: false,
       });
     } else {
       segments.push({ type: 'text', content: buffer.join('\n') });
