@@ -1,8 +1,11 @@
 import type {
+  ApiMessageContent,
+  ChatImageAttachment,
   LiveSource,
   LocalModelProgress,
   ModelModeId,
   ModelModeOption,
+  MultimodalPart,
   PersonaRule,
 } from '../types';
 import { buildSystemPrompt } from './systemPrompt';
@@ -13,14 +16,14 @@ export const MODEL_MODES: ModelModeOption[] = [
     id: 'auto',
     label: 'Auto-Router (Fast + Unlimited)',
     shortLabel: 'Auto-Router',
-    description: 'Zero-key multi-tier cloud router with instant failover',
+    description: 'Client-first multi-tier cloud router scaled for high concurrency',
     pollinationsModel: 'openai-fast',
   },
   {
     id: 'deepseek-r1',
     label: 'DeepSeek-R1 (Deep Step-by-Step Reasoning)',
     shortLabel: 'DeepSeek-R1',
-    description: 'DeepSeek V4.1 & Nemotron reasoning engines',
+    description: 'DeepSeek V4.1, Qwen3.5 397B & Nemotron reasoning engines',
     pollinationsModel: 'openai-fast',
   },
   {
@@ -32,9 +35,9 @@ export const MODEL_MODES: ModelModeOption[] = [
   },
   {
     id: 'coder-pro',
-    label: 'Coder Pro (Full-Stack App Builder)',
+    label: 'Coder Pro (Full-Stack App & Vision Builder)',
     shortLabel: 'Coder Pro',
-    description: 'Cohere NorthCode, DeepSeek & Mistral code engines',
+    description: 'GPT-OSS 120B, Qwen3.6 Coder, NorthCode & Vision-to-App engines',
     pollinationsModel: 'openai-fast',
   },
   {
@@ -46,15 +49,26 @@ export const MODEL_MODES: ModelModeOption[] = [
   },
 ];
 
+export interface HistoryTurnInput {
+  role: 'user' | 'assistant';
+  content: string;
+  images?: ChatImageAttachment[];
+}
+
 export interface RunChatStreamParams {
   modelMode: ModelModeId;
-  history: Array<{ role: 'user' | 'assistant'; content: string }>;
+  history: HistoryTurnInput[];
   liveSearchEnabled: boolean;
   personaRules: PersonaRule[];
   onSources?: (sources: LiveSource[]) => void;
   onToken: (token: string, engine: string) => void;
   onLocalProgress?: (progress: LocalModelProgress) => void;
   signal: AbortSignal;
+}
+
+interface ApiChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: ApiMessageContent;
 }
 
 const REALTIME_KEYWORDS =
@@ -89,9 +103,11 @@ function createLinkedTimeoutSignal(
 export function shouldTriggerLiveSearch(
   prompt: string,
   modelMode: ModelModeId,
-  liveSearchEnabled: boolean
+  liveSearchEnabled: boolean,
+  hasImages = false
 ): boolean {
   if (modelMode === 'searchgpt') return true;
+  if (hasImages) return false;
   if (!liveSearchEnabled) return false;
   if (REALTIME_KEYWORDS.test(prompt)) return true;
   if (CASUAL_OR_BUILD_ONLY.test(prompt)) return false;
@@ -104,6 +120,7 @@ async function fetchLiveSearchContext(
   query: string,
   parentSignal: AbortSignal
 ): Promise<{ sources: LiveSource[]; groundedSummary: string }> {
+  // Client-first Wikipedia + DuckDuckGo for scale, or /api/search/live with Google Grounding
   const searchGuard = createLinkedTimeoutSignal(parentSignal, 2400);
   try {
     const res = await fetch('/api/search/live', {
@@ -131,7 +148,6 @@ async function fetchLiveSearchContext(
     searchGuard.clear();
   }
 
-  // Client-side keyless backup search (Wikipedia + DuckDuckGo)
   const backupGuard = createLinkedTimeoutSignal(parentSignal, 2400);
   try {
     const [wikiRes, ddgRes] = await Promise.all([
@@ -182,11 +198,27 @@ async function fetchLiveSearchContext(
   }
 }
 
+function toTextOnlyMessages(messages: ApiChatMessage[]): Array<{
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}> {
+  return messages.map((m) => ({
+    role: m.role,
+    content:
+      typeof m.content === 'string'
+        ? m.content
+        : m.content
+            .map((p) => (p.type === 'text' ? p.text : '[Attached image]'))
+            .filter(Boolean)
+            .join('\n'),
+  }));
+}
+
 async function streamDirectOpenAISSE(
   endpointUrl: string,
   model: string,
   engineLabel: string,
-  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  messages: ApiChatMessage[],
   onToken: (token: string, engine: string) => void,
   parentSignal: AbortSignal,
   connectTimeoutMs = 4500
@@ -307,53 +339,107 @@ async function streamDirectOpenAISSE(
   return gotTokens;
 }
 
-async function directClientCloudFailover(
+/**
+ * Client-first direct browser routing across CORS-enabled keyless cloud engines.
+ * Each of the app's users (e.g. 5,000+ users) uses their own client IP,
+ * eliminating shared server IP rate-limit bottlenecks.
+ */
+async function tryClientDirectCloud(
   modelMode: ModelModeId,
-  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
+  messages: ApiChatMessage[],
+  hasImages: boolean,
   onToken: (token: string, engine: string) => void,
   parentSignal: AbortSignal
 ): Promise<string | null> {
   const OVH_URL = 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions';
   const LLM7_URL = 'https://api.llm7.io/v1/chat/completions';
-  const POLL_URL = 'https://text.pollinations.ai/openai';
 
-  // CORS-enabled direct browser targets (runs from the user's own IP!)
-  const directTargets: Array<{ url: string; model: string; label: string }> =
-    modelMode === 'deepseek-r1'
+  interface DirectTarget {
+    url: string;
+    model: string;
+    label: string;
+    timeoutMs?: number;
+    supportsVision?: boolean;
+  }
+
+  const directTargets: DirectTarget[] = hasImages
+    ? [
+        {
+          url: OVH_URL,
+          model: 'Qwen2.5-VL-72B-Instruct',
+          label: 'OVH Qwen2.5-VL 72B',
+          timeoutMs: 7000,
+          supportsVision: true,
+        },
+        {
+          url: OVH_URL,
+          model: 'qwen3-vl-30b-a3b',
+          label: 'OVH Qwen3-VL 30B',
+          timeoutMs: 7000,
+          supportsVision: true,
+        },
+        {
+          url: OVH_URL,
+          model: 'Mistral-Small-3.2-24B-Instruct-2506',
+          label: 'OVH Mistral 3.2 Vision',
+          timeoutMs: 6500,
+          supportsVision: true,
+        },
+        {
+          url: OVH_URL,
+          model: 'gemma-4-26b-a4b',
+          label: 'OVH Gemma 4 26B Vision',
+          timeoutMs: 6500,
+          supportsVision: true,
+        },
+      ]
+    : modelMode === 'coder-pro'
       ? [
-          { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'Direct OVH DeepSeek V4.1' },
-          { url: OVH_URL, model: 'gpt-oss-20b', label: 'Direct OVH GPT-OSS 20B' },
-          { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'Direct OVH Mistral 3.2' },
-          { url: LLM7_URL, model: 'DeepSeek-V4-Flash-0731', label: 'Direct LLM7 DeepSeek V4' },
-          { url: LLM7_URL, model: 'fast', label: 'Direct LLM7 Fast' },
-          { url: LLM7_URL, model: 'gemma4:31b', label: 'Direct LLM7 Gemma 4' },
-          { url: POLL_URL, model: 'openai-fast', label: 'Direct Pollinations' },
+          { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B', timeoutMs: 5500 },
+          { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B Coder', timeoutMs: 5500 },
+          { url: OVH_URL, model: 'Qwen3.5-397B-A17B', label: 'OVH Qwen3.5 397B', timeoutMs: 6500 },
+          { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
+          { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
+          { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
+          { url: LLM7_URL, model: 'codestral-latest', label: 'LLM7 Codestral' },
+          { url: LLM7_URL, model: 'glm-5.3-flash', label: 'LLM7 GLM-5.3' },
         ]
-      : [
-          { url: OVH_URL, model: 'gpt-oss-20b', label: 'Direct OVH GPT-OSS 20B' },
-          { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'Direct OVH Mistral 3.2' },
-          { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'Direct OVH DeepSeek V4.1' },
-          { url: LLM7_URL, model: 'fast', label: 'Direct LLM7 Fast' },
-          { url: LLM7_URL, model: 'glm-5.3-flash', label: 'Direct LLM7 GLM-5.3' },
-          { url: LLM7_URL, model: 'gemma4:31b', label: 'Direct LLM7 Gemma 4' },
-          { url: POLL_URL, model: 'openai-fast', label: 'Direct Pollinations' },
-        ];
+      : modelMode === 'deepseek-r1'
+        ? [
+            { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1', timeoutMs: 5500 },
+            { url: OVH_URL, model: 'Qwen3.5-397B-A17B', label: 'OVH Qwen3.5 397B', timeoutMs: 6500 },
+            { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B', timeoutMs: 5500 },
+            { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B' },
+            { url: LLM7_URL, model: 'DeepSeek-V4-Flash-0731', label: 'LLM7 DeepSeek V4' },
+            { url: LLM7_URL, model: 'gemma4:31b', label: 'LLM7 Gemma 4' },
+          ]
+        : [
+            { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
+            { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B' },
+            { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B', timeoutMs: 5500 },
+            { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
+            { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
+            { url: LLM7_URL, model: 'fast', label: 'LLM7 Fast' },
+            { url: LLM7_URL, model: 'glm-5.3-flash', label: 'LLM7 GLM-5.3' },
+          ];
 
   for (const target of directTargets) {
     if (parentSignal.aborted) throw new Error('Aborted');
     let emitted = false;
+    const payload =
+      hasImages && !target.supportsVision ? toTextOnlyMessages(messages) : messages;
     try {
       const ok = await streamDirectOpenAISSE(
         target.url,
         target.model,
         target.label,
-        messages,
+        payload,
         (tok, eng) => {
           emitted = true;
           onToken(tok, eng);
         },
         parentSignal,
-        4500
+        target.timeoutMs ?? 4500
       );
       if (ok) return target.label;
     } catch {
@@ -362,12 +448,42 @@ async function directClientCloudFailover(
     }
   }
 
-  // Non-streaming Pollinations POST fallback (compact prompt)
+  return null;
+}
+
+async function tryClientPollinationsBackup(
+  messages: ApiChatMessage[],
+  onToken: (token: string, engine: string) => void,
+  parentSignal: AbortSignal
+): Promise<string | null> {
+  const POLL_URL = 'https://text.pollinations.ai/openai';
+  const textMessages = toTextOnlyMessages(messages);
+
+  let emitted = false;
+  try {
+    const ok = await streamDirectOpenAISSE(
+      POLL_URL,
+      'openai-fast',
+      'Pollinations Direct SSE',
+      textMessages,
+      (tok, eng) => {
+        emitted = true;
+        onToken(tok, eng);
+      },
+      parentSignal,
+      4500
+    );
+    if (ok) return 'Pollinations Direct SSE';
+  } catch {
+    if (parentSignal.aborted) throw new Error('Aborted');
+    if (emitted) return 'Pollinations Direct SSE';
+  }
+
   const compactMessages = [
-    ...(messages[0]?.role === 'system'
-      ? [{ role: 'system' as const, content: messages[0].content.slice(0, 1200) }]
+    ...(textMessages[0]?.role === 'system'
+      ? [{ role: 'system' as const, content: textMessages[0].content.slice(0, 1200) }]
       : []),
-    ...messages.filter((m) => m.role !== 'system').slice(-6),
+    ...textMessages.filter((m) => m.role !== 'system').slice(-6),
   ];
 
   const postGuard = createLinkedTimeoutSignal(parentSignal, 6000);
@@ -395,13 +511,14 @@ async function directClientCloudFailover(
     postGuard.clear();
   }
 
-  // Safe-length GET fallback to Pollinations
   const getGuard = createLinkedTimeoutSignal(parentSignal, 6000);
   try {
     const lastUser = (
-      [...messages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
+      [...textMessages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
     ).slice(0, 900);
-    const sys = (messages.find((m) => m.role === 'system')?.content || '').slice(0, 500);
+    const sys = (
+      textMessages.find((m) => m.role === 'system')?.content || ''
+    ).slice(0, 500);
     const textRes = await fetch(
       `https://text.pollinations.ai/${encodeURIComponent(lastUser)}?model=openai-fast&system=${encodeURIComponent(sys)}`,
       { signal: getGuard.signal }
@@ -422,6 +539,51 @@ async function directClientCloudFailover(
   return null;
 }
 
+function buildApiMessages(
+  systemPrompt: string,
+  history: HistoryTurnInput[]
+): { apiMessages: ApiChatMessage[]; hasImages: boolean } {
+  const recent = history.slice(-14);
+  // Keep raw base64 image payloads only for the latest 2 turns that contain images
+  const imageTurnIndices = recent
+    .map((m, idx) => (m.images && m.images.length > 0 ? idx : -1))
+    .filter((idx) => idx >= 0);
+  const activeImageIndexSet = new Set(imageTurnIndices.slice(-2));
+  const hasImages = activeImageIndexSet.size > 0;
+
+  const formattedTurns: ApiChatMessage[] = recent.map((m, idx) => {
+    if (m.images && m.images.length > 0 && activeImageIndexSet.has(idx)) {
+      const parts: MultimodalPart[] = [
+        {
+          type: 'text',
+          text:
+            m.content.trim() ||
+            'Please analyze this image and build an interactive web app matching what you see.',
+        },
+        ...m.images.map((img) => ({
+          type: 'image_url' as const,
+          image_url: { url: img.dataUrl },
+        })),
+      ];
+      return { role: m.role, content: parts };
+    }
+
+    if (m.images && m.images.length > 0) {
+      return {
+        role: m.role,
+        content: `[Earlier uploaded ${m.images.length} image(s)]\n${m.content}`,
+      };
+    }
+
+    return { role: m.role, content: m.content };
+  });
+
+  return {
+    apiMessages: [{ role: 'system', content: systemPrompt }, ...formattedTurns],
+    hasImages,
+  };
+}
+
 export async function runChatStream(params: RunChatStreamParams): Promise<string> {
   const {
     modelMode,
@@ -434,16 +596,26 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
     signal,
   } = params;
 
-  const lastUserMsg = [...history].reverse().find((m) => m.role === 'user')?.content || '';
+  const lastUserTurn = [...history].reverse().find((m) => m.role === 'user');
+  const lastUserText = lastUserTurn?.content || '';
+  const hasAnyRecentImage = history
+    .slice(-6)
+    .some((m) => Boolean(m.images && m.images.length > 0));
+
   let liveSources: LiveSource[] = [];
   let groundedSummary = '';
 
   if (
-    lastUserMsg &&
+    lastUserText &&
     modelMode !== 'local-webgpu' &&
-    shouldTriggerLiveSearch(lastUserMsg, modelMode, liveSearchEnabled)
+    shouldTriggerLiveSearch(
+      lastUserText,
+      modelMode,
+      liveSearchEnabled,
+      hasAnyRecentImage
+    )
   ) {
-    const searchRes = await fetchLiveSearchContext(lastUserMsg, signal);
+    const searchRes = await fetchLiveSearchContext(lastUserText, signal);
     liveSources = searchRes.sources;
     groundedSummary = searchRes.groundedSummary;
     if (liveSources.length > 0) {
@@ -456,23 +628,16 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
     personaRules,
     liveSources,
     groundedSummary,
+    hasImages: hasAnyRecentImage,
   });
 
-  const payloadMessages: Array<{
-    role: 'system' | 'user' | 'assistant';
-    content: string;
-  }> = [
-    { role: 'system', content: systemPrompt },
-    ...history.slice(-14).map((m) => ({
-      role: m.role,
-      content: m.content,
-    })),
-  ];
+  const { apiMessages, hasImages } = buildApiMessages(systemPrompt, history);
 
-  // Offline / In-Browser Local AI Mode
-  if (modelMode === 'local-webgpu') {
+  // Offline / In-Browser Local AI Mode (text-only; images automatically escalate to cloud vision)
+  if (modelMode === 'local-webgpu' && !hasImages) {
+    const textMessages = toTextOnlyMessages(apiMessages);
     await streamLocalBrowserAI(
-      payloadMessages,
+      textMessages,
       (token) => onToken(token, 'Local Browser AI (Qwen2.5-Coder-1.5B)'),
       onLocalProgress,
       signal
@@ -482,9 +647,29 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
 
   const modeOption = MODEL_MODES.find((m) => m.id === modelMode) || MODEL_MODES[0];
   let engineUsed = `Cloud Router (${modeOption.shortLabel})`;
-  let gotAnyTokenFromBackend = false;
 
-  // Give backend waterfall 18s to emit its first token across OVH/Kilo/HF/LLM7 (clears immediately on first token)
+  // Tier 1 (5,000-user scale): Direct Browser-to-Cloud (CORS *, user's own IP!)
+  const directEngine = await tryClientDirectCloud(
+    modelMode,
+    apiMessages,
+    hasImages,
+    (token, eng) => {
+      engineUsed = eng;
+      onToken(token, eng);
+    },
+    signal
+  );
+
+  if (directEngine) {
+    return directEngine;
+  }
+
+  if (signal.aborted) {
+    throw new Error('Aborted');
+  }
+
+  // Tier 2: Backend Multi-Provider Proxy (Kilo Free Gateways, HF Gemma 4 Spaces, Server OVH, Gemini)
+  let gotAnyTokenFromBackend = false;
   const backendConnectGuard = createLinkedTimeoutSignal(signal, 18000);
   try {
     const res = await fetch('/api/ai/stream', {
@@ -496,7 +681,7 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
       body: JSON.stringify({
         model: modeOption.pollinationsModel,
         mode: modelMode,
-        messages: payloadMessages,
+        messages: apiMessages,
       }),
       signal: backendConnectGuard.signal,
     });
@@ -557,34 +742,31 @@ export async function runChatStream(params: RunChatStreamParams): Promise<string
     if (gotAnyTokenFromBackend) {
       return engineUsed;
     }
-    throw new Error('Empty stream from backend router');
   } catch (err) {
     backendConnectGuard.clear();
     if (signal.aborted) throw err;
-
     if (gotAnyTokenFromBackend) {
       return engineUsed;
     }
-
-    // Instant client-side multi-tier keyless failover directly from user's browser (CORS * providers)
-    const fallbackEngine = await directClientCloudFailover(
-      modelMode,
-      payloadMessages,
-      (token, eng) => {
-        engineUsed = eng;
-        onToken(token, eng);
-      },
-      signal
-    );
-
-    if (fallbackEngine) {
-      return fallbackEngine;
-    }
-
-    throw new Error(
-      'Unable to connect to cloud AI right now. Check your internet connection and tap Regenerate, or switch to Local WebGPU mode.'
-    );
   } finally {
     backendConnectGuard.clear();
   }
+
+  // Tier 3: Pollinations Direct Backup
+  const pollEngine = await tryClientPollinationsBackup(
+    apiMessages,
+    (token, eng) => {
+      engineUsed = eng;
+      onToken(token, eng);
+    },
+    signal
+  );
+
+  if (pollEngine) {
+    return pollEngine;
+  }
+
+  throw new Error(
+    'Unable to connect to cloud AI right now. Check your internet connection and tap Regenerate, or switch to Local WebGPU mode.'
+  );
 }

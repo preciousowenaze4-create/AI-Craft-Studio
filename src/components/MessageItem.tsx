@@ -8,6 +8,7 @@ import {
   RotateCcw,
   Volume2,
   VolumeX,
+  X,
 } from 'lucide-react';
 import type { ChatMessage } from '../types';
 import { parseThinkingContent } from '../utils/streamParser';
@@ -42,6 +43,7 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(
     const [activeSpeechId, setActiveSpeechId] = useState<string | null>(null);
     const [isEditing, setIsEditing] = useState(false);
     const [editText, setEditText] = useState(message.content);
+    const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
 
     const isSpeaking = activeSpeechId === message.id;
     const isSpeakingRef = useRef(false);
@@ -89,12 +91,13 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(
 
     const handleSaveEdit = () => {
       const trimmed = editText.trim();
-      if (!trimmed) return;
+      if (!trimmed && (!message.images || message.images.length === 0)) return;
       setIsEditing(false);
       onEditPrompt?.(message.id, trimmed);
     };
 
     if (message.role === 'user') {
+      const hasImages = Boolean(message.images && message.images.length > 0);
       return (
         <div className="flex justify-end group">
           <div className="max-w-[88%] sm:max-w-[78%] space-y-1.5">
@@ -127,8 +130,53 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(
                 </div>
               </div>
             ) : (
-              <div className="rounded-2xl bg-[#18181b] border border-zinc-800 px-4 py-3 text-[15px] leading-relaxed text-zinc-100 whitespace-pre-wrap break-words">
-                {message.content}
+              <div className="rounded-2xl bg-[#18181b] border border-zinc-800 px-4 py-3 text-[15px] leading-relaxed text-zinc-100 space-y-2.5">
+                {hasImages && (
+                  <div className="flex flex-wrap gap-2">
+                    {message.images!.map((img) => (
+                      <button
+                        key={img.id}
+                        type="button"
+                        onClick={() => setPreviewImageUrl(img.dataUrl)}
+                        className="group/img relative overflow-hidden rounded-xl border border-zinc-700/80 bg-zinc-950 focus:outline-none focus:ring-2 focus:ring-indigo-500 cursor-pointer"
+                        title={`View ${img.name}`}
+                      >
+                        <img
+                          src={img.dataUrl}
+                          alt={img.name}
+                          className="max-h-48 max-w-[240px] object-cover transition-transform duration-150 group-hover/img:scale-[1.02]"
+                        />
+                      </button>
+                    ))}
+                  </div>
+                )}
+                {message.content && (
+                  <div className="whitespace-pre-wrap break-words">
+                    {message.content}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {previewImageUrl && (
+              <div
+                className="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4"
+                onClick={() => setPreviewImageUrl(null)}
+              >
+                <button
+                  type="button"
+                  onClick={() => setPreviewImageUrl(null)}
+                  className="fixed top-4 right-4 min-h-[44px] min-w-[44px] flex items-center justify-center rounded-full bg-zinc-900 border border-zinc-700 text-zinc-200 hover:text-white cursor-pointer"
+                  aria-label="Close image preview"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+                <img
+                  src={previewImageUrl}
+                  alt="Uploaded preview"
+                  className="max-w-full max-h-[88dvh] rounded-xl border border-zinc-800 object-contain shadow-2xl"
+                  onClick={(e) => e.stopPropagation()}
+                />
               </div>
             )}
 

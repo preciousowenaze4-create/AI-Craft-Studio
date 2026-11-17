@@ -26,10 +26,26 @@ export interface LiveSource {
   provider: 'DuckDuckGo' | 'Wikipedia' | 'Google Search' | 'Google Maps' | 'SearchGPT';
 }
 
+export interface ChatImageAttachment {
+  id: string;
+  name: string;
+  mimeType: string;
+  dataUrl: string;
+  width?: number;
+  height?: number;
+}
+
+export type MultimodalPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } };
+
+export type ApiMessageContent = string | MultimodalPart[];
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  images?: ChatImageAttachment[];
   createdAt: number;
   modelMode?: ModelModeId;
   engineUsed?: string;

@@ -12,15 +12,20 @@ import {
   Cpu,
   FileSpreadsheet,
   Globe,
+  ImagePlus,
   MapPin,
   Menu,
+  Mic,
+  MicOff,
   Plus,
   Send,
   Sparkles,
   Square,
   Terminal,
+  X,
 } from 'lucide-react';
 import type {
+  ChatImageAttachment,
   ChatMessage,
   ChatSession,
   LiveSource,
@@ -30,6 +35,8 @@ import type {
 } from './types';
 import { MODEL_MODES, runChatStream } from './services/aiRouter';
 import { parseThinkingContent } from './utils/streamParser';
+import { processImageFile } from './utils/imageResize';
+import { useVoiceInput } from './hooks/useVoiceInput';
 import { MessageItem } from './components/MessageItem';
 import { Sidebar } from './components/Sidebar';
 import { MapsExplorerModal } from './components/MapsExplorerModal';
@@ -120,6 +127,11 @@ export default function App() {
   const [liveSearchEnabled, setLiveSearchEnabled] = useState(true);
 
   const [inputValue, setInputValue] = useState('');
+  const [pendingImages, setPendingImages] = useState<ChatImageAttachment[]>([]);
+  const [isProcessingImages, setIsProcessingImages] = useState(false);
+  const [composerNotice, setComposerNotice] = useState<string | null>(null);
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
   const [liveThinkingSec, setLiveThinkingSec] = useState(0);
@@ -154,6 +166,34 @@ export default function App() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const modeMenuRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const adjustTextareaHeight = useCallback(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, []);
+
+  const handleVoiceChange = useCallback(
+    (nextText: string) => {
+      setInputValue(nextText);
+      requestAnimationFrame(adjustTextareaHeight);
+    },
+    [adjustTextareaHeight]
+  );
+
+  const {
+    isSupported: isVoiceSupported,
+    isRecording,
+    voiceError,
+    clearVoiceError,
+    toggleRecording,
+    stopRecording,
+  } = useVoiceInput({
+    currentValue: inputValue,
+    onChangeValue: handleVoiceChange,
+  });
 
   const activeChat = useMemo(
     () => chats.find((c) => c.id === activeChatId) || chats[0],
@@ -165,12 +205,27 @@ export default function App() {
     [modelMode]
   );
 
-  // Persist chats, persona rules, and model mode
+  // Persist chats, persona rules, and model mode (gracefully trims older image payloads on QuotaExceededError)
   useEffect(() => {
     try {
       localStorage.setItem(CHATS_STORAGE_KEY, JSON.stringify(chats));
     } catch {
-      // ignore quota exceeded
+      try {
+        const trimmedChats = chats.map((chat, chatIdx) => ({
+          ...chat,
+          messages: chat.messages.map((msg, msgIdx) => {
+            const isRecent = chatIdx === 0 && msgIdx >= chat.messages.length - 4;
+            if (!isRecent && msg.images) {
+              const { images: _dropped, ...rest } = msg;
+              return rest;
+            }
+            return msg;
+          }),
+        }));
+        localStorage.setItem(CHATS_STORAGE_KEY, JSON.stringify(trimmedChats));
+      } catch {
+        // ignore persistent storage full
+      }
     }
   }, [chats]);
 
@@ -280,6 +335,7 @@ export default function App() {
           history: historyMessages.map((m) => ({
             role: m.role,
             content: m.content,
+            images: m.images,
           })),
           liveSearchEnabled,
           personaRules,
@@ -394,13 +450,62 @@ export default function App() {
     [modelMode, liveSearchEnabled, personaRules, scrollToBottom]
   );
 
+  const handleAddImageFiles = useCallback(
+    async (files: FileList | File[]) => {
+      const fileArray = Array.from(files).filter((f) => f.type.startsWith('image/'));
+      if (fileArray.length === 0) {
+        setComposerNotice('Please select a valid image file (PNG, JPG, WebP, etc.).');
+        return;
+      }
+
+      const slotsLeft = Math.max(0, 4 - pendingImages.length);
+      if (slotsLeft === 0) {
+        setComposerNotice('You can attach up to 4 pictures per message.');
+        return;
+      }
+
+      setComposerNotice(null);
+      setIsProcessingImages(true);
+      try {
+        const processed = await Promise.all(
+          fileArray.slice(0, slotsLeft).map((f) => processImageFile(f))
+        );
+        setPendingImages((prev) => [...prev, ...processed]);
+        if (fileArray.length > slotsLeft) {
+          setComposerNotice('Maximum 4 pictures per message. Extra images were skipped.');
+        }
+      } catch (err) {
+        setComposerNotice(
+          err instanceof Error ? err.message : 'Unable to process selected image.'
+        );
+      } finally {
+        setIsProcessingImages(false);
+        if (fileInputRef.current) {
+          fileInputRef.current.value = '';
+        }
+      }
+    },
+    [pendingImages.length]
+  );
+
   const handleSend = useCallback(
     async (overrideText?: string) => {
-      const text = (overrideText ?? inputValue).trim();
-      if (!text || isStreaming) return;
+      if (isRecording) {
+        stopRecording();
+      }
+      const rawText = (overrideText ?? inputValue).trim();
+      const imagesToSend = overrideText ? [] : pendingImages;
+      if ((!rawText && imagesToSend.length === 0) || isStreaming) return;
+
+      const text =
+        rawText ||
+        'Build a clean, complete interactive web app matching this image.';
 
       if (!overrideText) {
         setInputValue('');
+        setPendingImages([]);
+        setComposerNotice(null);
+        clearVoiceError();
         if (textareaRef.current) {
           textareaRef.current.style.height = 'auto';
         }
@@ -410,7 +515,8 @@ export default function App() {
       const userMsg: ChatMessage = {
         id: `msg_u_${now}`,
         role: 'user',
-        content: text,
+        content: rawText,
+        images: imagesToSend.length > 0 ? imagesToSend : undefined,
         createdAt: now,
       };
       const assistantMsg: ChatMessage = {
@@ -444,7 +550,18 @@ export default function App() {
       requestAnimationFrame(() => scrollToBottom(true));
       await executePrompt(targetId, updatedHistory, assistantMsg.id);
     },
-    [inputValue, isStreaming, activeChat, modelMode, executePrompt, scrollToBottom]
+    [
+      isRecording,
+      stopRecording,
+      inputValue,
+      pendingImages,
+      isStreaming,
+      clearVoiceError,
+      activeChat,
+      modelMode,
+      executePrompt,
+      scrollToBottom,
+    ]
   );
 
   const handleRegenerate = useCallback(
@@ -812,15 +929,119 @@ export default function App() {
             ))}
           </div>
 
+          {/* Voice or Upload Inline Notice */}
+          {(voiceError || composerNotice) && (
+            <div className="flex items-center justify-between gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+              <span>{voiceError || composerNotice}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  clearVoiceError();
+                  setComposerNotice(null);
+                }}
+                className="p-1 rounded-md hover:bg-amber-500/20 text-amber-200 cursor-pointer shrink-0"
+                aria-label="Dismiss notice"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           {/* Input Composer */}
-          <div className="rounded-2xl border border-zinc-800 bg-[#18181b] focus-within:border-zinc-700 transition-colors p-2">
+          <div
+            onDragOver={(e) => {
+              if (e.dataTransfer?.types?.includes('Files')) {
+                e.preventDefault();
+                setIsDraggingFiles(true);
+              }
+            }}
+            onDragLeave={() => setIsDraggingFiles(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setIsDraggingFiles(false);
+              if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
+                handleAddImageFiles(e.dataTransfer.files);
+              }
+            }}
+            className={`rounded-2xl border bg-[#18181b] transition-colors p-2 ${
+              isDraggingFiles
+                ? 'border-indigo-500 ring-1 ring-indigo-500/40'
+                : isRecording
+                  ? 'border-rose-500/60'
+                  : 'border-zinc-800 focus-within:border-zinc-700'
+            }`}
+          >
+            {/* Hidden image file picker */}
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files && e.target.files.length > 0) {
+                  handleAddImageFiles(e.target.files);
+                }
+              }}
+            />
+
+            {/* Pending uploaded picture thumbnails */}
+            {(pendingImages.length > 0 || isProcessingImages) && (
+              <div className="flex flex-wrap items-center gap-2 px-2 pt-1 pb-2">
+                {pendingImages.map((img) => (
+                  <div
+                    key={img.id}
+                    className="relative group/thumb rounded-xl border border-zinc-700 bg-zinc-900 overflow-hidden"
+                  >
+                    <img
+                      src={img.dataUrl}
+                      alt={img.name}
+                      className="w-16 h-16 object-cover"
+                    />
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setPendingImages((prev) =>
+                          prev.filter((item) => item.id !== img.id)
+                        )
+                      }
+                      className="absolute top-1 right-1 w-5 h-5 rounded-full bg-zinc-950/90 border border-zinc-700 flex items-center justify-center text-zinc-200 hover:text-white cursor-pointer"
+                      aria-label={`Remove ${img.name}`}
+                      title="Remove picture"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+                {isProcessingImages && (
+                  <div className="w-16 h-16 rounded-xl border border-dashed border-zinc-700 bg-zinc-900/60 flex items-center justify-center text-[11px] text-zinc-400">
+                    Loading...
+                  </div>
+                )}
+              </div>
+            )}
+
             <textarea
               ref={textareaRef}
               value={inputValue}
               onChange={(e) => {
                 setInputValue(e.target.value);
-                e.target.style.height = 'auto';
-                e.target.style.height = `${Math.min(e.target.scrollHeight, 160)}px`;
+                adjustTextareaHeight();
+              }}
+              onPaste={(e) => {
+                const items = e.clipboardData?.items;
+                if (!items) return;
+                const pastedImages: File[] = [];
+                for (let i = 0; i < items.length; i += 1) {
+                  if (items[i].type.startsWith('image/')) {
+                    const file = items[i].getAsFile();
+                    if (file) pastedImages.push(file);
+                  }
+                }
+                if (pastedImages.length > 0) {
+                  e.preventDefault();
+                  handleAddImageFiles(pastedImages);
+                }
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !e.shiftKey) {
@@ -829,24 +1050,76 @@ export default function App() {
                 }
               }}
               rows={1}
-              placeholder="Ask anything, search live facts, or describe an app to build..."
+              placeholder={
+                isRecording
+                  ? 'Listening... Speak now (tap mic again to pause/stop)'
+                  : pendingImages.length > 0
+                    ? 'Tell AI what to build, change, or remove from this picture...'
+                    : 'Ask anything, upload a picture to build, or tap mic to speak...'
+              }
               className="w-full bg-transparent px-2.5 py-1.5 text-[16px] sm:text-[15px] text-zinc-100 placeholder:text-zinc-500 focus:outline-none resize-none max-h-40 leading-relaxed"
             />
 
             <div className="mt-1.5 flex items-center justify-between gap-2 px-1">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 sm:gap-2 min-w-0">
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isStreaming}
+                  className="min-h-[38px] inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border border-zinc-800 bg-zinc-900 hover:border-zinc-700 hover:text-zinc-100 text-zinc-300 disabled:opacity-40 transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  title="Upload picture to build or edit an app"
+                >
+                  <ImagePlus className="w-4 h-4 text-sky-400 shrink-0" />
+                  <span className="hidden sm:inline">Upload Picture</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={toggleRecording}
+                  disabled={isStreaming}
+                  aria-pressed={isRecording}
+                  title={
+                    isRecording
+                      ? 'Stop voice dictation'
+                      : isVoiceSupported
+                        ? 'Tap to speak — tap again to stop, tap again to continue'
+                        : 'Voice dictation unavailable in this browser'
+                  }
+                  className={`min-h-[38px] inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-40 ${
+                    isRecording
+                      ? 'bg-rose-500/20 border-rose-500/50 text-rose-200'
+                      : 'bg-zinc-900 border-zinc-800 text-zinc-300 hover:border-zinc-700 hover:text-zinc-100'
+                  }`}
+                >
+                  {isRecording ? (
+                    <>
+                      <MicOff className="w-4 h-4 text-rose-400 animate-pulse shrink-0" />
+                      <span>Listening</span>
+                    </>
+                  ) : (
+                    <>
+                      <Mic className="w-4 h-4 text-indigo-400 shrink-0" />
+                      <span className="hidden sm:inline">Voice</span>
+                    </>
+                  )}
+                </button>
+
                 <button
                   type="button"
                   onClick={() => setLiveSearchEnabled((prev) => !prev)}
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                  className={`min-h-[38px] inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
                     liveSearchEnabled
                       ? 'bg-indigo-500/15 border-indigo-500/40 text-indigo-300'
                       : 'bg-zinc-900 border-zinc-800 text-zinc-400 hover:text-zinc-200'
                   }`}
+                  title="Toggle Live Web Search grounding"
                 >
                   <Globe className="w-3.5 h-3.5 shrink-0" />
-                  <span>
-                    Live Web Search: {liveSearchEnabled ? 'ON' : 'OFF'}
+                  <span className="hidden sm:inline">
+                    Web Search: {liveSearchEnabled ? 'ON' : 'OFF'}
+                  </span>
+                  <span className="sm:hidden">
+                    {liveSearchEnabled ? 'Search ON' : 'Search'}
                   </span>
                 </button>
               </div>
@@ -856,7 +1129,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={handleStopStreaming}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-red-600/20 hover:bg-red-600/30 border border-red-500/40 text-xs font-semibold text-red-300 cursor-pointer whitespace-nowrap"
+                    className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-red-600/20 hover:bg-red-600/30 border border-red-500/40 text-xs font-semibold text-red-300 cursor-pointer whitespace-nowrap"
                   >
                     <Square className="w-3.5 h-3.5" />
                     <span>Stop</span>
@@ -865,8 +1138,8 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => handleSend()}
-                    disabled={!inputValue.trim()}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-semibold text-white transition-colors cursor-pointer whitespace-nowrap"
+                    disabled={!inputValue.trim() && pendingImages.length === 0}
+                    className="min-h-[38px] inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-xs font-semibold text-white transition-colors cursor-pointer whitespace-nowrap"
                   >
                     <Send className="w-3.5 h-3.5" />
                     <span>Send</span>

@@ -5,6 +5,7 @@ export function buildSystemPrompt(options: {
   personaRules: PersonaRule[];
   liveSources?: LiveSource[];
   groundedSummary?: string;
+  hasImages?: boolean;
 }): string {
   const now = new Date();
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -52,6 +53,15 @@ export function buildSystemPrompt(options: {
     }Live Sources:\n${sourcesList}\n\nCite relevant facts accurately and include clickable Markdown links [Source Title](url) in your response.`;
   }
 
+  const visionSection = options.hasImages
+    ? `\n\n======================================================================\nVISION & IMAGE-TO-APP BUILDER INSTRUCTIONS\n======================================================================
+- The user attached image(s) (screenshot, UI mockup, sketch, design reference, or photo of their current work).
+- Carefully inspect layout structure, color palette, typography, components, and text shown in the image(s).
+- If the user asks to build, clone, recreate, or improve what is shown in the image, output a complete, self-contained runnable \`\`\`html code block (with Tailwind CSS CDN or inline CSS + interactive JS) ready for the Live Preview Sandbox.
+- If the user asks to REMOVE, hide, replace, or change specific parts visible in the image, omit or modify ONLY those requested parts while faithfully recreating/improving the rest in runnable code.
+- If the user simply asks what is in the image or for feedback, answer clearly and accurately based directly on visual observation.`
+    : '';
+
   const modeHint =
     options.modelMode === 'coder-pro'
       ? 'Active Mode: Coder Pro (Full-Stack App Builder). Prioritize complete, runnable, single-file or modular production code with zero placeholders.'
@@ -84,5 +94,5 @@ Start every response with <think>...</think> before your final answer. Inside <t
 ADAPTIVE RESPONSE RULES:
 - CASUAL_CHAT: Reply warmly and concisely; never dump unnecessary code blocks.
 - REALTIME_SEARCH: Give clear bulleted facts with clickable [Title](url) links.
-- APP_BUILDER / CODE_DEBUG: Provide complete, runnable production code with zero "// TODO" placeholders. For web apps, prefer a single self-contained HTML file (Tailwind CDN or clean CSS + JS) inside a \`\`\`html code block so it runs in the Live Preview Sandbox.${customTrainerSection}${liveSearchSection}`;
+- APP_BUILDER / CODE_DEBUG: Provide complete, runnable production code with zero "// TODO" placeholders. For web apps, output a complete single self-contained HTML file (with \`<!doctype html>\`, Tailwind CDN or clean CSS + interactive JS) inside a \`\`\`html code block so it launches immediately in the Live Preview Sandbox.${visionSection}${customTrainerSection}${liveSearchSection}`;
 }

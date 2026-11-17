@@ -25,9 +25,52 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
+interface MultimodalTextPart {
+  type: 'text';
+  text: string;
+}
+
+interface MultimodalImagePart {
+  type: 'image_url';
+  image_url: { url: string };
+}
+
+type MessageContent = string | Array<MultimodalTextPart | MultimodalImagePart>;
+
 interface IncomingMessage {
   role: 'system' | 'user' | 'assistant';
+  content: MessageContent;
+}
+
+function extractTextFromContent(content: MessageContent): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content
+    .map((part) => {
+      if (part.type === 'text') return part.text;
+      if (part.type === 'image_url') return '[Attached image]';
+      return '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+function hasImageAttachment(messages: IncomingMessage[]): boolean {
+  return messages.some(
+    (m) =>
+      Array.isArray(m.content) &&
+      m.content.some((part) => part.type === 'image_url' && Boolean(part.image_url?.url))
+  );
+}
+
+function toTextOnlyMessages(messages: IncomingMessage[]): Array<{
+  role: 'system' | 'user' | 'assistant';
   content: string;
+}> {
+  return messages.map((m) => ({
+    role: m.role,
+    content: extractTextFromContent(m.content),
+  }));
 }
 
 interface LiveSourceItem {
@@ -373,8 +416,9 @@ async function streamHuggingFaceGemma4Space(
 ): Promise<boolean> {
   const timeoutGuard = createLinkedTimeoutSignal(parentSignal, connectTimeoutMs);
 
-  const systemPrompt = messages.find((m) => m.role === 'system')?.content || '';
-  const nonSystem = messages.filter((m) => m.role !== 'system');
+  const textMessages = toTextOnlyMessages(messages);
+  const systemPrompt = textMessages.find((m) => m.role === 'system')?.content || '';
+  const nonSystem = textMessages.filter((m) => m.role !== 'system');
   const lastUser = [...nonSystem].reverse().find((m) => m.role === 'user')?.content || 'Hello';
   const priorTurns = nonSystem.slice(0, -1).map((m) => ({
     role: m.role,
@@ -503,11 +547,12 @@ async function fallbackPollinationsText(
   messages: IncomingMessage[],
   parentSignal: AbortSignal
 ): Promise<string> {
-  const compactMessages: IncomingMessage[] = [
-    ...(messages[0]?.role === 'system'
-      ? [{ role: 'system' as const, content: messages[0].content.slice(0, 1200) }]
+  const textMessages = toTextOnlyMessages(messages);
+  const compactMessages = [
+    ...(textMessages[0]?.role === 'system'
+      ? [{ role: 'system' as const, content: textMessages[0].content.slice(0, 1200) }]
       : []),
-    ...messages.filter((m) => m.role !== 'system').slice(-6),
+    ...textMessages.filter((m) => m.role !== 'system').slice(-6),
   ];
 
   const postGuard = createLinkedTimeoutSignal(parentSignal, 5500);
@@ -533,10 +578,10 @@ async function fallbackPollinationsText(
   const getGuard = createLinkedTimeoutSignal(parentSignal, 5500);
   try {
     const lastUser = (
-      [...messages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
+      [...textMessages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
     ).slice(0, 900);
     const systemMsg = (
-      messages.find((m) => m.role === 'system')?.content || ''
+      textMessages.find((m) => m.role === 'system')?.content || ''
     ).slice(0, 500);
     const getUrl = `https://text.pollinations.ai/${encodeURIComponent(lastUser)}?model=openai-fast&system=${encodeURIComponent(systemMsg)}`;
     const getRes = await fetch(getUrl, { signal: getGuard.signal });
@@ -555,7 +600,7 @@ async function fallbackPollinationsText(
 
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '4mb' }));
+  app.use(express.json({ limit: '10mb' }));
 
   // Public runtime Maps config (never exposes Gemini key; only Maps browser key if configured)
   app.get('/api/maps/client-config', (_req, res) => {
@@ -740,6 +785,7 @@ async function startServer() {
       model: string;
       label: string;
       timeoutMs?: number;
+      supportsVision?: boolean;
     }
 
     const OVH_URL = 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1/chat/completions';
@@ -747,46 +793,64 @@ async function startServer() {
     const LLM7_URL = 'https://api.llm7.io/v1/chat/completions';
     const POLL_URL = 'https://text.pollinations.ai/openai';
 
-    const providerChain: ProviderTarget[] =
-      mode === 'coder-pro'
+    const withImages = hasImageAttachment(messages);
+
+    const providerChain: ProviderTarget[] = withImages
+      ? [
+          { url: KILO_URL, model: 'nvidia/nemotron-3.5-super-vl:free', label: 'Kilo Nemotron VL Vision', timeoutMs: 8000, supportsVision: true },
+          { url: OVH_URL, model: 'Qwen2.5-VL-72B-Instruct', label: 'OVH Qwen2.5-VL 72B', timeoutMs: 7000, supportsVision: true },
+          { url: OVH_URL, model: 'qwen3-vl-30b-a3b', label: 'OVH Qwen3-VL 30B', timeoutMs: 7000, supportsVision: true },
+          { url: KILO_URL, model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', label: 'Kilo Nemotron Omni Vision', timeoutMs: 8000, supportsVision: true },
+          { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2 Vision', timeoutMs: 7000, supportsVision: true },
+          { url: OVH_URL, model: 'gemma-4-26b-a4b', label: 'OVH Gemma 4 26B Vision', timeoutMs: 7000, supportsVision: true },
+          { url: KILO_URL, model: 'openrouter/free', label: 'Kilo OpenRouter Free Vision', timeoutMs: 8000, supportsVision: true },
+        ]
+      : mode === 'coder-pro'
         ? [
             { url: KILO_URL, model: 'kilo-auto/free', label: 'Kilo Auto Free' },
-            { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
-            { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
+            { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B' },
+            { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B Coder' },
             { url: KILO_URL, model: 'cohere/north-mini-code:free', label: 'Kilo NorthCode' },
-            { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
+            { url: OVH_URL, model: 'Qwen3.5-397B-A17B', label: 'OVH Qwen3.5 397B' },
+            { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
             { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
+            { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
+            { url: LLM7_URL, model: 'codestral-latest', label: 'LLM7 Codestral' },
             { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
-            { url: LLM7_URL, model: 'glm-5.3-flash', label: 'LLM7 GLM-5.3 Flash' },
           ]
         : mode === 'deepseek-r1'
           ? [
               { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
               { url: KILO_URL, model: 'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free', label: 'Kilo Nemotron Reasoning' },
-              { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
+              { url: OVH_URL, model: 'Qwen3.5-397B-A17B', label: 'OVH Qwen3.5 397B' },
+              { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B' },
               { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
-              { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
+              { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B' },
               { url: LLM7_URL, model: 'DeepSeek-V4-Flash-0731', label: 'LLM7 DeepSeek V4' },
               { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
             ]
           : [
-              { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
               { url: KILO_URL, model: 'kilo-auto/free', label: 'Kilo Auto Free' },
-              { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
+              { url: OVH_URL, model: 'gpt-oss-20b', label: 'OVH GPT-OSS 20B' },
+              { url: OVH_URL, model: 'qwen3.6-35b-a3b', label: 'OVH Qwen3.6 35B' },
               { url: KILO_URL, model: 'nvidia/nemotron-3.5-lightning:free', label: 'Kilo Nemotron Lightning' },
-              { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
+              { url: OVH_URL, model: 'gpt-oss-120b', label: 'OVH GPT-OSS 120B' },
+              { url: OVH_URL, model: 'Mistral-Small-3.2-24B-Instruct-2506', label: 'OVH Mistral 3.2' },
               { url: KILO_URL, model: 'cohere/north-mini-code:free', label: 'Kilo NorthCode' },
+              { url: OVH_URL, model: 'DeepSeek-V4.1-Flash-1017', label: 'OVH DeepSeek V4.1' },
               { url: LLM7_URL, model: 'fast', label: 'LLM7 Cloud (fast)' },
               { url: LLM7_URL, model: 'glm-5.3-flash', label: 'LLM7 GLM-5.3 Flash' },
             ];
 
-    // Add Pollinations Classic only near the end (since it enforces a 45s per-IP cooldown)
-    providerChain.push({
-      url: POLL_URL,
-      model: normalizePollinationsModel(model),
-      label: `Pollinations (${normalizePollinationsModel(model)})`,
-      timeoutMs: 4500,
-    });
+    if (!withImages) {
+      // Add Pollinations Classic only near the end (since it enforces a 45s per-IP cooldown)
+      providerChain.push({
+        url: POLL_URL,
+        model: normalizePollinationsModel(model),
+        label: `Pollinations (${normalizePollinationsModel(model)})`,
+        timeoutMs: 4500,
+      });
+    }
 
     for (const target of providerChain) {
       if (controller.signal.aborted) {
@@ -794,17 +858,19 @@ async function startServer() {
         return;
       }
       let emittedFromTarget = false;
+      const targetMessages =
+        withImages && !target.supportsVision ? toTextOnlyMessages(messages) : messages;
       try {
         const ok = await streamOpenAICompatible(
           target.url,
           target.model,
-          messages,
+          targetMessages,
           (token) => {
             emittedFromTarget = true;
             sendEvent({ token, engine: target.label });
           },
           controller.signal,
-          target.timeoutMs ?? 4500
+          target.timeoutMs ?? 5000
         );
         if (ok) {
           sendEvent({ done: true, engine: target.label });
@@ -878,19 +944,40 @@ async function startServer() {
       }
     }
 
-    // Gemini server-side fallback if configured
+    // Gemini server-side fallback if configured (supports multimodal inlineData!)
     const ai = getGeminiClient();
     if (ai) {
       try {
-        const systemInstruction = messages.find((m) => m.role === 'system')?.content;
-        const userTurns = messages
-          .filter((m) => m.role !== 'system')
-          .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-          .join('\n\n');
+        const rawSystem = messages.find((m) => m.role === 'system')?.content;
+        const systemInstruction = rawSystem ? extractTextFromContent(rawSystem) : undefined;
+        const geminiParts: Array<
+          { text: string } | { inlineData: { mimeType: string; data: string } }
+        > = [];
+
+        for (const msg of messages.filter((m) => m.role !== 'system')) {
+          const prefix = msg.role === 'user' ? 'User: ' : 'Assistant: ';
+          if (typeof msg.content === 'string') {
+            geminiParts.push({ text: `${prefix}${msg.content}` });
+          } else if (Array.isArray(msg.content)) {
+            geminiParts.push({ text: prefix });
+            for (const part of msg.content) {
+              if (part.type === 'text') {
+                geminiParts.push({ text: part.text });
+              } else if (part.type === 'image_url' && part.image_url?.url) {
+                const match = part.image_url.url.match(/^data:([^;]+);base64,(.+)$/);
+                if (match) {
+                  geminiParts.push({
+                    inlineData: { mimeType: match[1], data: match[2] },
+                  });
+                }
+              }
+            }
+          }
+        }
 
         const stream = await ai.models.generateContentStream({
           model: 'gemini-4-hydrogen',
-          contents: userTurns,
+          contents: geminiParts,
           config: systemInstruction ? { systemInstruction } : undefined,
         });
         for await (const chunk of stream) {
