@@ -205,132 +205,272 @@ async function fetchGeminiSearchGrounding(
   }
 }
 
-async function streamPollinationsOpenAI(
+function createLinkedTimeoutSignal(
+  parentSignal: AbortSignal,
+  timeoutMs: number
+): { signal: AbortSignal; clear: () => void } {
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort();
+
+  if (parentSignal.aborted) {
+    controller.abort();
+  } else {
+    parentSignal.addEventListener('abort', onParentAbort, { once: true });
+  }
+
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  return {
+    signal: controller.signal,
+    clear: () => {
+      clearTimeout(timer);
+      parentSignal.removeEventListener('abort', onParentAbort);
+    },
+  };
+}
+
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error('Aborted'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('Aborted'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function normalizePollinationsModel(requestedModel: string): string {
+  // Only openai / openai-fast / gpt-oss-20b remain active on Classic Pollinations without 404
+  const valid = new Set(['openai', 'openai-fast', 'gpt-oss', 'gpt-oss-20b']);
+  return valid.has(requestedModel) ? requestedModel : 'openai-fast';
+}
+
+async function streamOpenAICompatible(
+  endpointUrl: string,
   model: string,
   messages: IncomingMessage[],
   onToken: (token: string) => void,
-  signal: AbortSignal
+  parentSignal: AbortSignal,
+  connectTimeoutMs = 7000
 ): Promise<boolean> {
-  const res = await fetch('https://text.pollinations.ai/openai', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model,
-      messages,
-      stream: true,
-    }),
-    signal,
-  });
+  const timeoutGuard = createLinkedTimeoutSignal(parentSignal, connectTimeoutMs);
+
+  let res: Response;
+  try {
+    res = await fetch(endpointUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream, application/json',
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: true,
+      }),
+      signal: timeoutGuard.signal,
+    });
+  } catch (err) {
+    timeoutGuard.clear();
+    throw err;
+  }
 
   if (!res.ok || !res.body) {
-    throw new Error(`Pollinations primary HTTP ${res.status}`);
+    timeoutGuard.clear();
+    throw new Error(`Upstream ${endpointUrl} HTTP ${res.status}`);
   }
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let emittedAny = false;
+  let openedReasoningTag = false;
+  let sawContentAfterReasoning = false;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  const emitChunk = (text: string) => {
+    if (!text) return;
+    if (!emittedAny) {
+      timeoutGuard.clear();
+      emittedAny = true;
+    }
+    onToken(text);
+  };
 
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line || !line.startsWith('data:')) continue;
-      const payload = line.slice(5).trim();
-      if (payload === '[DONE]') {
-        return emittedAny;
-      }
-      try {
-        const json = JSON.parse(payload) as {
-          choices?: Array<{
-            delta?: { content?: string; reasoning_content?: string };
-            message?: { content?: string };
-          }>;
-        };
-        const delta = json.choices?.[0]?.delta;
-        const content = delta?.content ?? json.choices?.[0]?.message?.content ?? '';
-        if (content) {
-          emittedAny = true;
-          onToken(content);
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line || !line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (payload === '[DONE]') {
+          if (openedReasoningTag && !sawContentAfterReasoning) {
+            emitChunk('</think>\n');
+          }
+          return emittedAny;
         }
-      } catch {
-        // Ignore partial JSON frames
+        try {
+          const json = JSON.parse(payload) as {
+            choices?: Array<{
+              delta?: {
+                content?: string | null;
+                reasoning?: string | null;
+                reasoning_content?: string | null;
+              };
+              message?: {
+                content?: string | null;
+                reasoning?: string | null;
+                reasoning_content?: string | null;
+              };
+            }>;
+          };
+          const delta = json.choices?.[0]?.delta;
+          const msg = json.choices?.[0]?.message;
+          const reasoning =
+            delta?.reasoning ??
+            delta?.reasoning_content ??
+            msg?.reasoning ??
+            msg?.reasoning_content ??
+            '';
+          const content = delta?.content ?? msg?.content ?? '';
+
+          if (reasoning && !sawContentAfterReasoning) {
+            if (!openedReasoningTag) {
+              openedReasoningTag = true;
+              if (!reasoning.trimStart().startsWith('<think>')) {
+                emitChunk('<think>\n');
+              }
+            }
+            emitChunk(reasoning);
+          }
+
+          if (content) {
+            if (openedReasoningTag && !sawContentAfterReasoning) {
+              sawContentAfterReasoning = true;
+              if (!content.trimStart().startsWith('</think>')) {
+                emitChunk('\n</think>\n\n');
+              }
+            }
+            emitChunk(content);
+          }
+        } catch {
+          // Ignore partial JSON frames
+        }
       }
     }
+  } finally {
+    timeoutGuard.clear();
   }
 
+  if (openedReasoningTag && !sawContentAfterReasoning) {
+    emitChunk('</think>\n');
+  }
   return emittedAny;
+}
+
+async function fetchLlm7NonStreaming(
+  model: string,
+  messages: IncomingMessage[],
+  parentSignal: AbortSignal
+): Promise<string> {
+  const timeoutGuard = createLinkedTimeoutSignal(parentSignal, 12000);
+  try {
+    const res = await fetch('https://api.llm7.io/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages,
+        stream: false,
+      }),
+      signal: timeoutGuard.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`LLM7 non-stream HTTP ${res.status}`);
+    }
+    const data = (await res.json()) as {
+      choices?: Array<{
+        message?: {
+          content?: string;
+          reasoning_content?: string;
+          reasoning?: string;
+        };
+      }>;
+    };
+    const msg = data.choices?.[0]?.message;
+    const content = msg?.content?.trim() || '';
+    const reasoning = (msg?.reasoning_content || msg?.reasoning || '').trim();
+    if (!content) {
+      throw new Error('Empty LLM7 response');
+    }
+    if (reasoning && !content.includes('<think>')) {
+      return `<think>\n${reasoning}\n</think>\n\n${content}`;
+    }
+    return content;
+  } finally {
+    timeoutGuard.clear();
+  }
 }
 
 async function fallbackPollinationsText(
   messages: IncomingMessage[],
-  model: string,
-  signal: AbortSignal
+  parentSignal: AbortSignal
 ): Promise<string> {
-  const res = await fetch('https://text.pollinations.ai/', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      messages,
-      model: model === 'deepseek-r1' ? 'deepseek-r1' : 'openai',
-      private: true,
-    }),
-    signal,
-  });
-  if (res.ok) {
-    const text = await res.text();
-    if (text.trim()) return text;
-  }
-
-  // GET fallback with condensed prompt
-  const lastUser = [...messages].reverse().find((m) => m.role === 'user')?.content || 'Hello';
-  const systemMsg = messages.find((m) => m.role === 'system')?.content || '';
-  const getUrl = `https://text.pollinations.ai/${encodeURIComponent(lastUser)}?system=${encodeURIComponent(systemMsg.slice(0, 1200))}`;
-  const getRes = await fetch(getUrl, { signal });
-  if (!getRes.ok) {
-    throw new Error(`Pollinations GET fallback HTTP ${getRes.status}`);
-  }
-  return await getRes.text();
-}
-
-async function fallbackHuggingFacePublic(
-  messages: IncomingMessage[],
-  signal: AbortSignal
-): Promise<string> {
-  const prompt = messages
-    .map((m) => `<|${m.role}|>\n${m.content}`)
-    .join('\n')
-    .concat('\n<|assistant|>\n');
-
-  const res = await fetch(
-    'https://api-inference.huggingface.co/models/Qwen/Qwen2.5-Coder-32B-Instruct',
-    {
+  const postGuard = createLinkedTimeoutSignal(parentSignal, 9000);
+  try {
+    const res = await fetch('https://text.pollinations.ai/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        inputs: prompt,
-        parameters: { max_new_tokens: 1024, return_full_text: false },
+        messages,
+        model: 'openai-fast',
+        private: true,
       }),
-      signal,
+      signal: postGuard.signal,
+    });
+    if (res.ok) {
+      const text = await res.text();
+      if (text.trim()) return text;
     }
-  );
-  if (!res.ok) {
-    throw new Error(`Hugging Face public fallback HTTP ${res.status}`);
+  } finally {
+    postGuard.clear();
   }
-  const data = (await res.json()) as Array<{ generated_text?: string }> | { generated_text?: string };
-  if (Array.isArray(data) && data[0]?.generated_text) {
-    return data[0].generated_text;
+
+  // GET fallback with condensed prompt capped safely under URL length limits
+  const getGuard = createLinkedTimeoutSignal(parentSignal, 9000);
+  try {
+    const lastUser = (
+      [...messages].reverse().find((m) => m.role === 'user')?.content || 'Hello'
+    ).slice(0, 900);
+    const systemMsg = (
+      messages.find((m) => m.role === 'system')?.content || ''
+    ).slice(0, 500);
+    const getUrl = `https://text.pollinations.ai/${encodeURIComponent(lastUser)}?model=openai-fast&system=${encodeURIComponent(systemMsg)}`;
+    const getRes = await fetch(getUrl, { signal: getGuard.signal });
+    if (!getRes.ok) {
+      throw new Error(`Pollinations GET fallback HTTP ${getRes.status}`);
+    }
+    const text = await getRes.text();
+    if (!text.trim()) {
+      throw new Error('Empty Pollinations GET response');
+    }
+    return text;
+  } finally {
+    getGuard.clear();
   }
-  if (!Array.isArray(data) && data.generated_text) {
-    return data.generated_text;
-  }
-  throw new Error('Empty Hugging Face response');
 }
 
 async function startServer() {
@@ -482,7 +622,7 @@ async function startServer() {
 
   // Resilient Multi-Tier Keyless AI Streaming Router
   app.post('/api/ai/stream', async (req, res) => {
-    const { model = 'openai', messages } = req.body as {
+    const { model = 'openai-fast', messages } = req.body as {
       model?: string;
       messages?: IncomingMessage[];
     };
@@ -498,7 +638,11 @@ async function startServer() {
     res.flushHeaders?.();
 
     const controller = new AbortController();
-    req.on('close', () => controller.abort());
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        controller.abort();
+      }
+    });
 
     const sendEvent = (data: Record<string, unknown>) => {
       if (!res.writableEnded) {
@@ -506,27 +650,78 @@ async function startServer() {
       }
     };
 
-    try {
-      // Tier 1: Primary Engine — Pollinations OpenAI-compatible streaming
-      const primaryOk = await streamPollinationsOpenAI(
-        model,
-        messages,
-        (token) => sendEvent({ token, engine: `Pollinations (${model})` }),
-        controller.signal
-      );
+    const safePollinationsModel = normalizePollinationsModel(model);
 
-      if (primaryOk) {
-        sendEvent({ done: true, engine: `Pollinations (${model})` });
+    // Tier 1: Primary Instant SSE Stream — Pollinations OpenAI-compatible (active free model)
+    try {
+      const ok = await streamOpenAICompatible(
+        'https://text.pollinations.ai/openai',
+        safePollinationsModel,
+        messages,
+        (token) => sendEvent({ token, engine: `Pollinations (${safePollinationsModel})` }),
+        controller.signal,
+        7000
+      );
+      if (ok) {
+        sendEvent({ done: true, engine: `Pollinations (${safePollinationsModel})` });
         res.end();
         return;
       }
     } catch {
-      // Continue immediately to Tier 2 failover
+      if (controller.signal.aborted) {
+        res.end();
+        return;
+      }
     }
 
+    // Tier 2: Fast Keyless Backup SSE Stream — LLM7.io (fast)
     try {
-      // Tier 2: Secondary Automatic Failover — Pollinations POST/GET text endpoint
-      const text = await fallbackPollinationsText(messages, model, controller.signal);
+      const ok = await streamOpenAICompatible(
+        'https://api.llm7.io/v1/chat/completions',
+        'fast',
+        messages,
+        (token) => sendEvent({ token, engine: 'LLM7 Cloud (fast)' }),
+        controller.signal,
+        7500
+      );
+      if (ok) {
+        sendEvent({ done: true, engine: 'LLM7 Cloud (fast)' });
+        res.end();
+        return;
+      }
+    } catch {
+      if (controller.signal.aborted) {
+        res.end();
+        return;
+      }
+    }
+
+    // Tier 3: Automatic Retry with LLM7 (default) after short 1.1s rate-limit backoff
+    try {
+      await sleepAbortable(1100, controller.signal);
+      const ok = await streamOpenAICompatible(
+        'https://api.llm7.io/v1/chat/completions',
+        'default',
+        messages,
+        (token) => sendEvent({ token, engine: 'LLM7 Cloud (default)' }),
+        controller.signal,
+        8500
+      );
+      if (ok) {
+        sendEvent({ done: true, engine: 'LLM7 Cloud (default)' });
+        res.end();
+        return;
+      }
+    } catch {
+      if (controller.signal.aborted) {
+        res.end();
+        return;
+      }
+    }
+
+    // Tier 4: Pollinations POST / GET Text Fallback
+    try {
+      const text = await fallbackPollinationsText(messages, controller.signal);
       if (text) {
         sendEvent({ token: text, engine: 'Pollinations Text Failover' });
         sendEvent({ done: true, engine: 'Pollinations Text Failover' });
@@ -534,18 +729,23 @@ async function startServer() {
         return;
       }
     } catch {
-      // Continue immediately to Tier 3 failover
+      if (controller.signal.aborted) {
+        res.end();
+        return;
+      }
     }
 
+    // Tier 5: Non-streaming LLM7 retry
     try {
-      // Tier 3: Hugging Face Free Public Inference Fallback
-      const hfText = await fallbackHuggingFacePublic(messages, controller.signal);
-      sendEvent({ token: hfText, engine: 'Hugging Face Public Failover' });
-      sendEvent({ done: true, engine: 'Hugging Face Public Failover' });
-      res.end();
-      return;
+      const text = await fetchLlm7NonStreaming('default', messages, controller.signal);
+      if (text) {
+        sendEvent({ token: text, engine: 'LLM7 Cloud Failover' });
+        sendEvent({ done: true, engine: 'LLM7 Cloud Failover' });
+        res.end();
+        return;
+      }
     } catch (err) {
-      // Tier 4: Gemini server-side fallback if configured (for grounding/resilience)
+      // Tier 6: Gemini server-side fallback if configured
       const ai = getGeminiClient();
       if (ai) {
         try {
@@ -569,7 +769,7 @@ async function startServer() {
           res.end();
           return;
         } catch {
-          // Fall through to error
+          // Fall through to final error
         }
       }
 

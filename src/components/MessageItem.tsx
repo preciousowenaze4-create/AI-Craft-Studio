@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
   Copy,
@@ -11,6 +11,12 @@ import {
 } from 'lucide-react';
 import type { ChatMessage } from '../types';
 import { parseThinkingContent } from '../utils/streamParser';
+import {
+  isSpeechSupported,
+  stopSpeech,
+  subscribeSpeechState,
+  toggleMessageSpeech,
+} from '../utils/speech';
 import { ThinkingAccordion } from './ThinkingAccordion';
 import { MarkdownRenderer } from './MarkdownRenderer';
 
@@ -33,9 +39,25 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(
     onExportTableToSheets,
   }) => {
     const [copied, setCopied] = useState(false);
-    const [isSpeaking, setIsSpeaking] = useState(false);
+    const [activeSpeechId, setActiveSpeechId] = useState<string | null>(null);
     const [isEditing, setIsEditing] = useState(false);
     const [editText, setEditText] = useState(message.content);
+
+    const isSpeaking = activeSpeechId === message.id;
+    const isSpeakingRef = useRef(false);
+    isSpeakingRef.current = isSpeaking;
+
+    useEffect(() => {
+      return subscribeSpeechState(setActiveSpeechId);
+    }, []);
+
+    useEffect(() => {
+      return () => {
+        if (isSpeakingRef.current) {
+          stopSpeech();
+        }
+      };
+    }, []);
 
     const parsed = useMemo(() => {
       if (message.role === 'user') return null;
@@ -57,24 +79,12 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(
     };
 
     const handleToggleSpeech = () => {
-      if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
-      if (isSpeaking) {
-        window.speechSynthesis.cancel();
-        setIsSpeaking(false);
-        return;
-      }
-
-      window.speechSynthesis.cancel();
+      if (!isSpeechSupported()) return;
       const text =
         message.role === 'assistant' && parsed
           ? parsed.answerContent || message.content
           : message.content;
-      const cleanText = text.replace(/```[\s\S]*?```/g, 'Code block omitted.');
-      const utterance = new SpeechSynthesisUtterance(cleanText);
-      utterance.onend = () => setIsSpeaking(false);
-      utterance.onerror = () => setIsSpeaking(false);
-      setIsSpeaking(true);
-      window.speechSynthesis.speak(utterance);
+      toggleMessageSpeech(message.id, text);
     };
 
     const handleSaveEdit = () => {
@@ -268,13 +278,18 @@ export const MessageItem: React.FC<MessageItemProps> = React.memo(
                 <button
                   type="button"
                   onClick={handleToggleSpeech}
-                  className="inline-flex items-center gap-1.5 px-2 py-1 rounded-md text-xs text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/70 transition-colors cursor-pointer whitespace-nowrap"
-                  title={isSpeaking ? 'Stop reading' : 'Read aloud'}
+                  aria-pressed={isSpeaking}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 sm:px-2 sm:py-1 rounded-md text-xs transition-colors cursor-pointer whitespace-nowrap ${
+                    isSpeaking
+                      ? 'bg-indigo-500/15 text-indigo-300 border border-indigo-500/30'
+                      : 'text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/70 border border-transparent'
+                  }`}
+                  title={isSpeaking ? 'Stop reading aloud' : 'Read aloud'}
                 >
                   {isSpeaking ? (
                     <>
                       <VolumeX className="w-3.5 h-3.5 text-indigo-400" />
-                      <span className="text-indigo-300">Stop</span>
+                      <span className="font-medium text-indigo-300">Stop</span>
                     </>
                   ) : (
                     <>
