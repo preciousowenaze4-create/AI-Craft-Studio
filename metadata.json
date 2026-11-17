@@ -1,0 +1,6 @@
+{
+  "name": "Vektor Studio",
+  "description": "Keyless, zero-lag full-screen AI Chat, Live Web Search, and Interactive App Builder with local WebGPU AI, Google Maps Grounding, and Google Sheets sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
